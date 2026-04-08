@@ -1,0 +1,89 @@
+services:
+  # ─── Infrastructure ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: e2etool
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── API Server ──────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/e2etool
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-refresh-secret-change-in-production}
+      STORAGE_TYPE: ${STORAGE_TYPE:-local}
+      STORAGE_LOCAL_PATH: /app/storage
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      RUNNER_SECRET: ${RUNNER_SECRET:-runner-internal-secret}
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Web Frontend ────────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      API_URL: http://api:4000
+      NEXT_PUBLIC_API_URL: ${APP_URL:-http://localhost:4000}
+    depends_on:
+      - api
+
+  # ─── Web Runner (Playwright) ─────────────────────────────────────
+  runner-web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runner-web
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      API_URL: http://api:4000
+      RUNNER_SECRET: ${RUNNER_SECRET:-runner-internal-secret}
+      RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-4}
+      BROWSER: ${BROWSER:-chromium}
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    shm_size: "2gb"  # Playwright needs extra shared memory
+
+volumes:
+  postgres_data:
+  redis_data:

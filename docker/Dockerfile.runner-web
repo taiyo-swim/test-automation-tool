@@ -1,0 +1,17 @@
+# Use the official Playwright image which includes all browser dependencies
+FROM mcr.microsoft.com/playwright:v1.49.1-noble AS base
+RUN corepack enable
+
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml ./
+COPY packages/runner-web/package.json ./packages/runner-web/
+COPY packages/types/package.json ./packages/types/
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+RUN pnpm --filter types build
+RUN pnpm --filter runner-web build
+
+ENV NODE_ENV=production
+
+CMD ["node", "packages/runner-web/dist/index.js"]

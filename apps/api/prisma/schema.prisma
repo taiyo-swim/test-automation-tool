@@ -1,0 +1,239 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String?
+  avatarUrl    String?
+  createdAt    DateTime @default(now())
+
+  teamMembers   TeamMember[]
+  triggeredRuns TestRun[]
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  members  TeamMember[]
+  projects Project[]
+}
+
+model TeamMember {
+  teamId String
+  userId String
+  role   String // owner | editor | viewer
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([teamId, userId])
+}
+
+model Project {
+  id         String   @id @default(cuid())
+  teamId     String
+  name       String
+  platform   String   // web | android | api
+  baseUrl    String?
+  appPackage String?
+  createdAt  DateTime @default(now())
+
+  team         Team          @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  tests        Test[]
+  runs         TestRun[]
+  environments Environment[]
+  schedules    Schedule[]
+  apiTokens    ApiToken[]
+  sharedSteps  SharedStep[]
+  baselines    VisualBaseline[]
+}
+
+model Environment {
+  id        String @id @default(cuid())
+  projectId String
+  name      String
+  variables Json   // { KEY: encryptedValue }
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Test {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  description String?
+  tags        String[]
+  folderId    String?
+  status      String   @default("active") // active | archived
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project  Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  steps    TestStep[]
+  results  TestRunResult[]
+  dataSets TestDataSet[]
+}
+
+model TestStep {
+  id           String  @id @default(cuid())
+  testId       String
+  order        Int
+  action       String
+  params       Json
+  sharedStepId String?
+  createdAt    DateTime @default(now())
+
+  test        Test        @relation(fields: [testId], references: [id], onDelete: Cascade)
+  sharedStep  SharedStep? @relation(fields: [sharedStepId], references: [id])
+  stepResults StepResult[]
+
+  @@index([testId, order])
+}
+
+model SharedStep {
+  id        String @id @default(cuid())
+  projectId String
+  name      String
+  steps     Json   // StepDefinition[]
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  testSteps TestStep[]
+}
+
+model TestDataSet {
+  id         String @id @default(cuid())
+  testId     String
+  name       String
+  csvContent String
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+}
+
+model TestRun {
+  id            String    @id @default(cuid())
+  projectId     String
+  trigger       String    // manual | schedule | api | ci
+  status        String    // queued | running | passed | failed | cancelled
+  environment   String?
+  triggeredById String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  triggeredBy User?           @relation(fields: [triggeredById], references: [id])
+  results     TestRunResult[]
+
+  @@index([projectId, createdAt(sort: Desc)])
+}
+
+model TestRunResult {
+  id           String    @id @default(cuid())
+  runId        String
+  testId       String
+  status       String    // passed | failed | skipped
+  durationMs   Int?
+  errorMessage String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  videoUrl     String?
+
+  run         TestRun     @relation(fields: [runId], references: [id], onDelete: Cascade)
+  test        Test        @relation(fields: [testId], references: [id])
+  stepResults StepResult[]
+
+  @@index([runId])
+}
+
+model StepResult {
+  id             String    @id @default(cuid())
+  runResultId    String
+  stepId         String
+  order          Int
+  status         String    // passed | failed | skipped
+  screenshotPath String?
+  logText        String?
+  durationMs     Int?
+  executedAt     DateTime?
+
+  runResult         TestRunResult      @relation(fields: [runResultId], references: [id], onDelete: Cascade)
+  step              TestStep           @relation(fields: [stepId], references: [id])
+  visualDiff        VisualDiff?
+  healingSuggestion HealingSuggestion?
+
+  @@index([runResultId, order])
+}
+
+model VisualBaseline {
+  id        String   @id @default(cuid())
+  projectId String
+  testId    String
+  stepId    String
+  imagePath String
+  createdAt DateTime @default(now())
+
+  project Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  diffs   VisualDiff[]
+
+  @@unique([projectId, testId, stepId])
+}
+
+model VisualDiff {
+  id             String   @id @default(cuid())
+  stepResultId   String   @unique
+  baselineId     String
+  diffImagePath  String?
+  diffPercentage Float
+  status         String   @default("pending") // pending | approved | rejected
+  createdAt      DateTime @default(now())
+
+  stepResult StepResult     @relation(fields: [stepResultId], references: [id], onDelete: Cascade)
+  baseline   VisualBaseline @relation(fields: [baselineId], references: [id])
+}
+
+model HealingSuggestion {
+  id                String   @id @default(cuid())
+  stepResultId      String   @unique
+  originalSelector  String
+  suggestedSelector String
+  confidence        Float
+  reason            String
+  status            String   @default("pending") // pending | accepted | rejected
+  createdAt         DateTime @default(now())
+
+  stepResult StepResult @relation(fields: [stepResultId], references: [id], onDelete: Cascade)
+}
+
+model Schedule {
+  id             String    @id @default(cuid())
+  projectId      String
+  name           String
+  cronExpression String
+  environmentId  String?
+  enabled        Boolean   @default(true)
+  lastRunAt      DateTime?
+  nextRunAt      DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model ApiToken {
+  id         String    @id @default(cuid())
+  projectId  String
+  name       String
+  tokenHash  String    @unique
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
