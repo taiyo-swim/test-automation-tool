@@ -10,33 +10,48 @@ const client = axios.create({
   timeout: 30_000,
 });
 
-export interface RunDetails {
-  id: string;
-  projectId: string;
-  status: string;
-  environment?: string;
-  results: Array<{
-    id: string;
-    testId: string;
-    status: string;
-  }>;
+// ── Run ──────────────────────────────────────────────────────────────
+
+export async function updateRunStatus(runId: string, status: string, finishedAt?: Date) {
+  await client.patch(`/internal/runs/${runId}`, {
+    status,
+    ...(finishedAt && { finishedAt: finishedAt.toISOString() }),
+  });
 }
+
+// ── Results ───────────────────────────────────────────────────────────
+
+export async function createRunResult(runId: string, testId: string): Promise<{ id: string }> {
+  const { data } = await client.post(`/internal/runs/${runId}/results`, { testId });
+  return data;
+}
+
+export async function updateRunResult(
+  resultId: string,
+  status: string,
+  durationMs: number,
+  errorMessage?: string
+) {
+  await client.patch(`/internal/results/${resultId}`, { status, durationMs, errorMessage });
+}
+
+export async function createStepResult(
+  resultId: string,
+  stepResult: Omit<StepResult, "id">
+): Promise<StepResult> {
+  const { data } = await client.post(`/internal/results/${resultId}/steps`, stepResult);
+  return data;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
 
 export interface TestDetails {
   id: string;
   projectId: string;
   platform: string;
   name: string;
+  baseUrl?: string;
   steps: TestStep[];
-}
-
-export interface EnvironmentDetails {
-  variables: Record<string, string>;
-}
-
-export async function fetchRun(runId: string): Promise<RunDetails> {
-  const { data } = await client.get(`/internal/runs/${runId}`);
-  return data;
 }
 
 export async function fetchTestWithSteps(testId: string): Promise<TestDetails> {
@@ -44,13 +59,29 @@ export async function fetchTestWithSteps(testId: string): Promise<TestDetails> {
   return data;
 }
 
-export async function fetchEnvironmentVariables(projectId: string, envName?: string): Promise<Record<string, string>> {
+// ── Environment ───────────────────────────────────────────────────────
+
+export async function fetchEnvironmentVariables(
+  projectId: string,
+  envName?: string
+): Promise<Record<string, string>> {
   if (!envName) return {};
   const { data } = await client.get(`/internal/projects/${projectId}/env/${envName}`);
-  return data.variables ?? {};
+  return (data.variables as Record<string, string>) ?? {};
 }
 
-export async function fetchBaseline(projectId: string, testId: string, stepId: string): Promise<{ imagePath: string } | null> {
+// ── Visual Regression ─────────────────────────────────────────────────
+
+export interface BaselineInfo {
+  id: string;
+  imagePath: string;
+}
+
+export async function fetchBaseline(
+  projectId: string,
+  testId: string,
+  stepId: string
+): Promise<BaselineInfo | null> {
   try {
     const { data } = await client.get(`/internal/baselines/${projectId}/${testId}/${stepId}`);
     return data;
@@ -59,22 +90,19 @@ export async function fetchBaseline(projectId: string, testId: string, stepId: s
   }
 }
 
-export async function updateRunStatus(runId: string, status: string, finishedAt?: Date) {
-  await client.patch(`/internal/runs/${runId}`, { status, finishedAt });
-}
-
-export async function createRunResult(runId: string, testId: string) {
-  const { data } = await client.post(`/internal/runs/${runId}/results`, { testId });
-  return data as { id: string };
-}
-
-export async function updateRunResult(resultId: string, status: string, durationMs: number, errorMessage?: string) {
-  await client.patch(`/internal/results/${resultId}`, { status, durationMs, errorMessage });
-}
-
-export async function createStepResult(resultId: string, stepResult: Omit<StepResult, "id">) {
-  const { data } = await client.post(`/internal/results/${resultId}/steps`, stepResult);
-  return data as StepResult;
+export async function createBaseline(
+  projectId: string,
+  testId: string,
+  stepId: string,
+  imagePath: string
+): Promise<BaselineInfo> {
+  const { data } = await client.post(`/internal/baselines`, {
+    projectId,
+    testId,
+    stepId,
+    imagePath,
+  });
+  return data;
 }
 
 export async function saveVisualDiff(
@@ -83,8 +111,15 @@ export async function saveVisualDiff(
   diffImagePath: string,
   diffPercentage: number
 ) {
-  await client.post(`/internal/visual-diffs`, { stepResultId, baselineId, diffImagePath, diffPercentage });
+  await client.post(`/internal/visual-diffs`, {
+    stepResultId,
+    baselineId,
+    diffImagePath,
+    diffPercentage,
+  });
 }
+
+// ── Self-Healing ──────────────────────────────────────────────────────
 
 export async function saveHealingSuggestion(
   stepResultId: string,
@@ -94,10 +129,38 @@ export async function saveHealingSuggestion(
   reason: string
 ) {
   await client.post(`/internal/healing-suggestions`, {
-    stepResultId, originalSelector, suggestedSelector, confidence, reason,
+    stepResultId,
+    originalSelector,
+    suggestedSelector,
+    confidence,
+    reason,
   });
 }
 
+// ── WebSocket Broadcast ───────────────────────────────────────────────
+
 export async function broadcastWs(runId: string, event: object) {
   await client.post(`/internal/ws-broadcast`, { runId, event });
+}
+
+// ── Screenshot Upload ─────────────────────────────────────────────────
+
+export async function uploadScreenshot(
+  runId: string,
+  stepId: string,
+  data: Buffer
+): Promise<string> {
+  const filename = `${stepId}_${Date.now()}.png`;
+  const { data: result } = await client.post(
+    `/internal/screenshots/${runId}/${filename}`,
+    data,
+    {
+      headers: {
+        "Content-Type": "image/png",
+        "x-runner-secret": runnerSecret,
+      },
+      maxBodyLength: 52_428_800,
+    }
+  );
+  return (result as { url: string }).url;
 }

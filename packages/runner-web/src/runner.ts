@@ -1,7 +1,6 @@
-import { chromium, firefox, webkit, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import { chromium, firefox, webkit, type Browser, type Page } from "@playwright/test";
 import type { RunJobData, TestStep } from "@e2e-tool/types";
 import {
-  fetchRun,
   fetchTestWithSteps,
   fetchEnvironmentVariables,
   updateRunStatus,
@@ -10,11 +9,16 @@ import {
   createStepResult,
   broadcastWs,
   fetchBaseline,
+  createBaseline,
   saveVisualDiff,
   saveHealingSuggestion,
+  uploadScreenshot,
 } from "./api-client.js";
 import { executeStep } from "./actions/index.js";
 import { compareWithBaseline } from "./visual.js";
+import path from "path";
+import os from "os";
+import fs from "fs/promises";
 
 export async function executeRun(jobData: RunJobData) {
   const { runId, projectId, testIds, environment } = jobData;
@@ -26,8 +30,8 @@ export async function executeRun(jobData: RunJobData) {
   let overallStatus: "passed" | "failed" = "passed";
 
   for (const testId of testIds) {
-    const result = await runTest(runId, testId, envVars);
-    if (result !== "passed") overallStatus = "failed";
+    const status = await runTest(runId, testId, envVars);
+    if (status !== "passed") overallStatus = "failed";
   }
 
   const finishedAt = new Date();
@@ -45,6 +49,12 @@ async function runTest(
   envVars: Record<string, string>
 ): Promise<"passed" | "failed"> {
   const test = await fetchTestWithSteps(testId);
+
+  // Add BASE_URL from project config if not already set
+  if (test.baseUrl && !envVars.BASE_URL) {
+    envVars = { BASE_URL: test.baseUrl, ...envVars };
+  }
+
   const resultRecord = await createRunResult(runId, testId);
   const resultId = resultRecord.id;
 
@@ -61,13 +71,12 @@ async function runTest(
   });
   const page = await context.newPage();
 
-  // Apply env variable substitution to step params
   const steps = substituteEnvVars(test.steps, envVars);
+  const variables: Record<string, string> = { ...envVars };
 
   const startTime = Date.now();
   let status: "passed" | "failed" = "passed";
   let errorMessage: string | undefined;
-  const variables: Record<string, string> = { ...envVars };
 
   for (const step of steps) {
     const stepStart = Date.now();
@@ -83,32 +92,58 @@ async function runTest(
 
     try {
       const result = await executeStep(page, step, variables);
-      if (result.screenshot) {
-        // Save screenshot via API
-        screenshotUrl = await uploadScreenshot(runId, testId, step.id, result.screenshot);
 
-        // Visual regression check
+      // Upload screenshot if captured
+      if (result.screenshot) {
+        screenshotUrl = await uploadScreenshot(runId, step.id, result.screenshot);
+
+        // Visual regression
         if ((step.params as Record<string, unknown>).visual_regression) {
-          await handleVisualRegression(
-            test.projectId ?? "",
-            testId,
-            step.id,
-            result.screenshot,
-            await createStepResult(resultId, {
-              runResultId: resultId,
-              stepId: step.id,
-              order: step.order,
-              status: "passed",
-              screenshotUrl,
-              durationMs: Date.now() - stepStart,
-              executedAt: new Date().toISOString(),
-            })
-          );
+          const baseline = await fetchBaseline(test.projectId, testId, step.id);
+          if (baseline) {
+            // Compare with existing baseline
+            const tempPath = path.join(os.tmpdir(), `baseline_${step.id}.png`);
+            // Download baseline for comparison — use local path if available
+            const diffResult = await compareWithBaseline(result.screenshot, baseline.imagePath.startsWith("/api/files/")
+              ? baseline.imagePath.replace("/api/files/", (process.env.STORAGE_LOCAL_PATH ?? "./storage") + "/")
+              : baseline.imagePath);
+
+            if (diffResult) {
+              // Upload diff image
+              const diffBuffer = await fs.readFile(diffResult.diffPath).catch(() => null);
+              let diffUrl = diffResult.diffPath;
+              if (diffBuffer) {
+                diffUrl = await uploadScreenshot(runId, `${step.id}_diff`, diffBuffer);
+              }
+
+              // Get the step result ID after creation below
+              const sr = await createStepResult(resultId, {
+                runResultId: resultId,
+                stepId: step.id,
+                order: step.order,
+                status: stepStatus,
+                screenshotUrl,
+                logText: result.log ?? `✓ ${step.action}`,
+                durationMs: Date.now() - stepStart,
+                executedAt: new Date().toISOString(),
+              });
+
+              await saveVisualDiff(sr.id, baseline.id, diffUrl, diffResult.diffPercentage);
+
+              await broadcastWs(runId, { type: "step:finished", runId, payload: sr });
+              continue; // skip duplicate createStepResult below
+            }
+          } else {
+            // No baseline yet — create one
+            await createBaseline(test.projectId, testId, step.id, screenshotUrl ?? "");
+          }
         }
       }
+
       if (result.extractedVar) {
         variables[result.extractedVar.name] = result.extractedVar.value;
       }
+
       stepLog = result.log ?? `✓ ${step.action}`;
     } catch (err) {
       stepStatus = "failed";
@@ -117,16 +152,16 @@ async function runTest(
       stepLog = `✗ ${step.action}: ${errMsg}`;
       errorMessage = errMsg;
 
-      // Capture screenshot on failure
+      // Capture failure screenshot
       try {
-        const failScreenshot = await page.screenshot({ fullPage: false });
-        screenshotUrl = await uploadScreenshot(runId, testId, `${step.id}_fail`, failScreenshot);
-
-        // Try self-healing selector suggestion
-        await trySelfHeal(page, step, resultId);
+        const failShot = await page.screenshot({ fullPage: false });
+        screenshotUrl = await uploadScreenshot(runId, `${step.id}_fail`, failShot);
       } catch {
-        // Ignore screenshot/healing errors
+        // Ignore screenshot errors
       }
+
+      // Try self-healing
+      await trySelfHeal(page, step, resultId);
     }
 
     const stepDuration = Date.now() - stepStart;
@@ -141,24 +176,20 @@ async function runTest(
       executedAt: new Date().toISOString(),
     });
 
-    await broadcastWs(runId, {
-      type: "step:finished",
-      runId,
-      payload: stepResult,
-    });
+    await broadcastWs(runId, { type: "step:finished", runId, payload: stepResult });
 
-    if (stepStatus === "failed") break; // Stop on first failure
+    if (stepStatus === "failed") break;
   }
 
   await browser.close();
 
-  const duration = Date.now() - startTime;
-  await updateRunResult(resultId, status, duration, errorMessage);
+  const durationMs = Date.now() - startTime;
+  await updateRunResult(resultId, status, durationMs, errorMessage);
 
   await broadcastWs(runId, {
     type: "result:finished",
     runId,
-    payload: { resultId, status, durationMs: duration },
+    payload: { resultId, status, durationMs },
   });
 
   return status;
@@ -166,55 +197,31 @@ async function runTest(
 
 async function launchBrowser(): Promise<Browser> {
   const browserType = process.env.BROWSER ?? "chromium";
-  if (browserType === "firefox") return firefox.launch({ headless: true });
-  if (browserType === "webkit") return webkit.launch({ headless: true });
-  return chromium.launch({ headless: true });
+  const options = { headless: true };
+  if (browserType === "firefox") return firefox.launch(options);
+  if (browserType === "webkit") return webkit.launch(options);
+  return chromium.launch(options);
 }
 
 function substituteEnvVars(steps: TestStep[], vars: Record<string, string>): TestStep[] {
   return steps.map((step) => ({
     ...step,
-    params: substituteInObject(step.params, vars),
+    params: substituteInObject(step.params as Record<string, unknown>, vars),
   }));
 }
 
-function substituteInObject(obj: Record<string, unknown>, vars: Record<string, string>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (typeof value === "string") {
-      result[key] = value.replace(/\{\{(\w+)\}\}/g, (_, name) => vars[name] ?? `{{${name}}}`);
-    } else {
-      result[key] = value;
-    }
-  }
-  return result;
-}
-
-async function uploadScreenshot(_runId: string, _testId: string, _stepId: string, _data: Buffer): Promise<string> {
-  // Upload to API which saves to storage
-  // For now return a placeholder - actual upload handled by runner API client
-  return `/api/files/screenshots/${_runId}/${_stepId}.png`;
-}
-
-async function handleVisualRegression(
-  projectId: string,
-  testId: string,
-  stepId: string,
-  screenshot: Buffer,
-  stepResult: { id: string }
-) {
-  const baseline = await fetchBaseline(projectId, testId, stepId);
-  if (baseline) {
-    const diffResult = await compareWithBaseline(screenshot, baseline.imagePath);
-    if (diffResult) {
-      await saveVisualDiff(
-        stepResult.id,
-        baseline.imagePath,
-        diffResult.diffPath,
-        diffResult.diffPercentage
-      );
-    }
-  }
+function substituteInObject(
+  obj: Record<string, unknown>,
+  vars: Record<string, string>
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(obj).map(([k, v]) => [
+      k,
+      typeof v === "string"
+        ? v.replace(/\{\{(\w+)\}\}/g, (_, name) => vars[name] ?? `{{${name}}}`)
+        : v,
+    ])
+  );
 }
 
 async function trySelfHeal(page: Page, step: TestStep, resultId: string) {
@@ -222,32 +229,43 @@ async function trySelfHeal(page: Page, step: TestStep, resultId: string) {
   const originalSelector = params.selector as string | undefined;
   if (!originalSelector) return;
 
-  // Simple heuristic: find elements with similar text or role
-  const suggestion = await page.evaluate((sel: string) => {
-    // Try to find element by text content if selector fails
-    const text = sel.replace(/[#.[\]="']/g, " ").trim().split(/\s+/).filter(Boolean).join(" ");
-    const elements = document.querySelectorAll("button, a, input, [role='button'], [role='link']");
-    for (const el of elements) {
-      const elText = el.textContent?.trim() ?? "";
-      if (elText && text && elText.toLowerCase().includes(text.toLowerCase())) {
-        const testId = el.getAttribute("data-testid");
-        if (testId) return `[data-testid="${testId}"]`;
-        const id = el.getAttribute("id");
-        if (id) return `#${id}`;
-        const name = el.getAttribute("name");
-        if (name) return `[name="${name}"]`;
-      }
-    }
-    return null;
-  }, originalSelector);
+  try {
+    const suggestion = await page.evaluate((sel: string) => {
+      const keywords = sel.replace(/[#.\[\]="']/g, " ").trim().split(/\s+/).filter(Boolean);
+      if (keywords.length === 0) return null;
 
-  if (suggestion) {
-    await saveHealingSuggestion(
-      resultId,
-      originalSelector,
-      suggestion,
-      0.7,
-      "テキスト内容が一致する要素が見つかりました"
-    );
+      const candidates = Array.from(
+        document.querySelectorAll("button, a, input, select, textarea, [role='button'], [role='link'], [role='menuitem']")
+      );
+
+      for (const el of candidates) {
+        const text = (el.textContent?.trim() ?? "").toLowerCase();
+        const matches = keywords.some((kw) => text.includes(kw.toLowerCase()));
+
+        if (matches) {
+          const testId = el.getAttribute("data-testid");
+          if (testId) return `[data-testid="${testId}"]`;
+          const id = el.id;
+          if (id) return `#${id}`;
+          const name = el.getAttribute("name");
+          if (name) return `[name="${name}"]`;
+          const ariaLabel = el.getAttribute("aria-label");
+          if (ariaLabel) return `[aria-label="${ariaLabel}"]`;
+        }
+      }
+      return null;
+    }, originalSelector);
+
+    if (suggestion) {
+      await saveHealingSuggestion(
+        resultId,
+        originalSelector,
+        suggestion,
+        0.75,
+        "テキスト・役割が一致する要素を発見しました"
+      );
+    }
+  } catch {
+    // Self-healing is best-effort
   }
 }

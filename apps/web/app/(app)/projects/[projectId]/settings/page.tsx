@@ -3,9 +3,10 @@
 import { useParams } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Copy, Plus, Trash2, RefreshCw } from "lucide-react";
+import { Plus, Trash2, RefreshCw } from "lucide-react";
 import { api } from "../../../../../lib/api";
 import type { Project, Environment } from "@e2e-tool/types";
+import clsx from "clsx";
 
 export default function ProjectSettingsPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -220,6 +221,3 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function clsx(...classes: (string | boolean | undefined)[]) {
-  return classes.filter(Boolean).join(" ");
-}
