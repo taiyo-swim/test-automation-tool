@@ -9,6 +9,17 @@
 - セルフホスト型 (マネージドサービス依存を最小化)
 - ローカル/CI実行が主 → クラウドRunnerは将来対応
 
+**インフラ段階戦略:**
+
+| フェーズ | 環境 | 方法 | コスト |
+|---|---|---|---|
+| ① 開発中 | ローカルPC | Docker Desktop + Docker Compose | $0 |
+| ② チーム共有前 | AWS EC2 t3.micro | Docker Compose をそのまま移植 | $0 (12ヶ月無料枠) |
+| ③ チーム採用後 | AWS 本格構成 | ECS + RDS + ElastiCache + S3 | $30〜/月 |
+
+フェーズ①→②は `docker-compose.yml` をサーバーに持っていくだけ。  
+フェーズ②→③は環境変数と設定ファイルの変更のみで移行できるよう設計する。
+
 ---
 
 ## 2. システム全体アーキテクチャ
@@ -539,41 +550,49 @@ steps:
 
 ---
 
-## 9. Docker Compose 構成
+## 9. インフラ段階設計
+
+### フェーズ① : ローカル開発 (完全無料)
+
+**Docker Desktop** (Mac / Windows / Linux) をインストールするだけ。
 
 ```yaml
-# docker-compose.yml
+# docker-compose.yml  ← これ1ファイルで全サービスが起動
 services:
-  web:                    # Next.js フロントエンド
+  web:
     build: ./apps/web
     ports: ["3000:3000"]
 
-  api:                    # Fastify API Server
+  api:
     build: ./apps/api
     ports: ["4000:4000"]
     depends_on: [postgres, redis]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/e2etool
+      REDIS_URL: redis://redis:6379
+      STORAGE_TYPE: local
+      STORAGE_LOCAL_PATH: /app/storage
     volumes:
-      - ./storage:/app/storage  # スクリーンショット保存先
+      - ./storage:/app/storage  # スクリーンショット・動画の保存先
 
   postgres:
     image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: e2etool
     volumes: [postgres_data:/var/lib/postgresql/data]
 
   redis:
     image: redis:7-alpine
 
-  runner-web:             # Playwright Runner
-    build: ./packages/runner-web
+  runner-web:
+    build: ./packages/runner-web    # Playwright同梱
     depends_on: [api, redis]
-    # Playwrightのブラウザ同梱
+    environment:
+      API_URL: http://api:4000
+      REDIS_URL: redis://redis:6379
 
-  runner-android:         # Appium Runner (オプション)
-    build: ./packages/runner-android
-    devices:              # Android エミュレータ
-      - /dev/kvm:/dev/kvm
-    depends_on: [api, redis]
-
-  runner-api:             # API Runner
+  runner-api:
     build: ./packages/runner-api
     depends_on: [api, redis]
 
@@ -581,16 +600,158 @@ volumes:
   postgres_data:
 ```
 
+起動コマンド:
+```bash
+docker compose up -d
+# → http://localhost:3000 でアクセス可能
+```
+
 ---
 
-## 10. コスト比較
+### フェーズ② : AWS EC2 無料枠 (チーム共有・検証)
 
-| 項目 | 本ツール (MVP) | MagicPod |
-|---|---|---|
-| ライセンス | $0 (全OSS) | $400〜/月 |
-| Web実行インフラ | $0〜$20/月 (VPS) | 込み |
-| Android実行 | $0 (自前エミュレータ) | 込み |
-| iOS実行 | 非対応 (将来) | 込み |
-| ストレージ | $0 (ローカル) | 込み |
-| AI機能 | Claude API従量課金 | 込み |
-| **合計** | **$0〜$20/月** | **$400〜/月** |
+**AWS 12ヶ月無料枠** を使用。フェーズ①の `docker-compose.yml` をほぼそのままEC2に持ち込む。
+
+#### 使用するAWSサービス (全て無料枠内)
+
+| サービス | スペック | 無料枠 | 用途 |
+|---|---|---|---|
+| **EC2** | t3.micro (2vCPU / 1GiB) | 750時間/月 × 12ヶ月 | 全サービス稼働 |
+| **S3** | - | 5GB / 月20,000リクエスト | スクリーンショット・動画保存 |
+| **ECR** | - | 500MB/月 | Dockerイメージ保存 (任意) |
+| **CloudWatch Logs** | - | 5GB/月 | ログ収集 |
+
+**PostgreSQL・Redisは引き続きDockerで動かす** (RDS・ElastiCacheは無料枠終了後に高額になるため)。
+
+#### EC2 セットアップ手順
+
+```bash
+# 1. EC2 t3.micro (Amazon Linux 2023) を起動
+#    - セキュリティグループ: 80 (HTTP), 443 (HTTPS), 22 (SSH) を開放
+
+# 2. Docker + Docker Compose インストール
+sudo dnf install -y docker
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+
+# 3. リポジトリをクローン
+git clone https://github.com/your-org/test-automation-tool.git
+cd test-automation-tool
+
+# 4. 環境変数を設定
+cp .env.example .env
+# .env に AWS S3バケット名・認証情報等を記入
+
+# 5. 起動 (フェーズ①と全く同じコマンド)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+#### docker-compose.prod.yml (本番上書き設定)
+
+```yaml
+# docker-compose.prod.yml  ← フェーズ②用の差分のみ
+services:
+  web:
+    restart: always
+    environment:
+      NEXT_PUBLIC_API_URL: https://your-domain.com
+
+  api:
+    restart: always
+    environment:
+      STORAGE_TYPE: s3                    # ← ローカルからS3に切り替え
+      AWS_S3_BUCKET: your-bucket-name
+      AWS_REGION: ap-northeast-1
+      APP_URL: https://your-domain.com
+
+  runner-web:
+    restart: always
+
+  runner-api:
+    restart: always
+
+  # nginx リバースプロキシ (HTTPS終端)
+  nginx:
+    image: nginx:alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro  # Let's Encrypt 証明書
+    depends_on: [web, api]
+    restart: always
+```
+
+**フェーズ②のコスト: $0** (12ヶ月間)  
+S3スクリーンショット保存: 5GB無料枠内に収まる見込み
+
+---
+
+### フェーズ③ : AWS 本格構成 (チーム採用後)
+
+無料枠終了後や利用規模が大きくなった場合。  
+**環境変数と設定変更のみで移行可能**な設計にする。
+
+```
+フェーズ② (EC2 All-in-One)    →    フェーズ③ (AWS マネージドサービス)
+
+Docker PostgreSQL               →    RDS PostgreSQL db.t3.micro (~$13/月)
+Docker Redis                    →    ElastiCache cache.t3.micro (~$13/月)
+EC2 上のRunner                 →    ECS Fargate (使った分だけ課金)
+ローカルストレージ / S3         →    S3 (継続)
+手動デプロイ                   →    GitHub Actions + ECR + ECS
+```
+
+**フェーズ③の概算コスト: $30〜$60/月**
+
+---
+
+## 10. Docker Compose 環境変数設計
+
+アプリケーションは環境変数で動作環境を切り替える。コード変更なしにフェーズ移行できる。
+
+```bash
+# .env.example
+
+# DB
+DATABASE_URL=postgres://postgres:postgres@postgres:5432/e2etool
+
+# Redis
+REDIS_URL=redis://redis:6379
+
+# Auth
+JWT_SECRET=change-this-secret
+JWT_REFRESH_SECRET=change-this-refresh-secret
+
+# Storage: "local" | "s3"
+STORAGE_TYPE=local
+STORAGE_LOCAL_PATH=./storage
+AWS_S3_BUCKET=
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_REGION=ap-northeast-1
+
+# App URL (HTTPS化後に変更)
+APP_URL=http://localhost:3000
+
+# OAuth (オプション)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# Slack通知 (オプション)
+SLACK_WEBHOOK_URL=
+
+# AI機能 (Phase 5)
+ANTHROPIC_API_KEY=
+```
+
+---
+
+## 11. コスト比較
+
+| 項目 | フェーズ① | フェーズ② | フェーズ③ | MagicPod |
+|---|---|---|---|---|
+| 期間 | 開発中 | 検証〜採用判断 | 採用後 | - |
+| インフラ | $0 | $0 (無料枠) | $30〜$60/月 | $400〜/月 |
+| AI機能 | - | - | 従量課金 | 込み |
+| iOS対応 | - | - | 将来検討 | 込み |
+| **合計** | **$0** | **$0** | **$30〜$60/月** | **$400〜/月** |
