@@ -1,305 +1,472 @@
 # E2E Test Automation Tool - システム設計書
 
-## 1. システム全体アーキテクチャ
+## 1. 設計方針
+
+**コスト最小化のための原則:**
+- OSSのみ使用 ($0ライセンス)
+- モノリスファースト (マイクロサービスは将来対応)
+- Docker Compose で全サービスを管理 (Kubernetes不要)
+- セルフホスト型 (マネージドサービス依存を最小化)
+- ローカル/CI実行が主 → クラウドRunnerは将来対応
+
+---
+
+## 2. システム全体アーキテクチャ
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          クライアント層                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
-│  │  Web Dashboard│  │Chrome Extension│  │  CLI / SDK (Python/TS)   │ │
-│  │  (Next.js)   │  │  (Record)    │  │                            │ │
-│  └──────┬───────┘  └──────┬───────┘  └─────────────┬──────────────┘ │
-└─────────┼────────────────┼──────────────────────────┼───────────────┘
-          │                │                          │
-          ▼                ▼                          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          API Gateway (TLS)                           │
-│                     (Rate Limiting / Auth)                           │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-          ┌──────────────────┼───────────────────┐
-          ▼                  ▼                   ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│   Core API       │ │  Execution API   │ │   AI Service     │
-│  (Fastify/TS)    │ │  (Fastify/TS)    │ │  (Python/FastAPI)│
-│  - CRUD          │ │  - Job dispatch  │ │  - Test gen      │
-│  - Auth/RBAC     │ │  - Result ingest │ │  - Self-healing  │
-│  - Projects      │ │  - Streaming log │ │  - NL parsing    │
-└────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
-         │                   │                     │
-         ▼                   ▼                     ▼
-┌──────────────────────────────────────────────────────────────┐
-│                        内部インフラ                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐ │
-│  │  PostgreSQL  │  │  Redis      │  │  Object Storage      │ │
-│  │  (主DB)     │  │  (Queue/    │  │  (S3-compatible)     │ │
-│  │             │  │   Cache)    │  │  Screenshots/Videos  │ │
-│  └─────────────┘  └──────┬──────┘  └──────────────────────┘ │
-└──────────────────────────┼───────────────────────────────────┘
-                           │  Job Queue (BullMQ)
-          ┌────────────────┼───────────────────┐
-          ▼                ▼                   ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│  Web Runner      │ │  Mobile Runner   │ │  API Runner      │
-│  (Playwright)    │ │  (Appium)        │ │  (Axios/Fetch)   │
-│  Docker container│ │  Docker container│ │  Docker container│
-└──────────────────┘ └──────────────────┘ └──────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                   クライアント                         │
+│  ┌────────────────────┐  ┌────────────────────────┐  │
+│  │   Web Dashboard    │  │  Chrome Extension      │  │
+│  │   (Next.js)        │  │  (Record & Playback)   │  │
+│  └─────────┬──────────┘  └──────────┬─────────────┘  │
+└────────────┼─────────────────────────┼────────────────┘
+             │ HTTPS                   │ HTTPS
+             ▼                         ▼
+┌──────────────────────────────────────────────────────┐
+│               API Server (Monolith)                   │
+│               Node.js + TypeScript + Fastify          │
+│                                                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │  Auth       │  │  Projects   │  │  Tests      │  │
+│  │  Module     │  │  Module     │  │  Module     │  │
+│  └─────────────┘  └─────────────┘  └─────────────┘  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │  Execution  │  │  Reports    │  │  Team       │  │
+│  │  Module     │  │  Module     │  │  Module     │  │
+│  └─────────────┘  └─────────────┘  └─────────────┘  │
+│                                                       │
+│  WebSocket Server (実行ログのリアルタイム配信)          │
+└──────────┬───────────────────────────────────────────┘
+           │
+     ┌─────┴─────┐
+     │           │
+     ▼           ▼
+┌─────────┐  ┌──────────────────────────────────┐
+│PostgreSQL│  │  Redis (BullMQ Job Queue)        │
+│  (主DB)  │  │  + キャッシュ                    │
+└─────────┘  └──────────────┬───────────────────┘
+                             │  Job dispatch
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+    ┌──────────────┐ ┌─────────────┐ ┌──────────────┐
+    │  Web Runner  │ │Android Runner│ │  API Runner  │
+    │  (Playwright)│ │  (Appium)   │ │  (Axios)     │
+    │  Docker      │ │  Docker     │ │  Docker      │
+    └──────┬───────┘ └──────┬──────┘ └──────┬───────┘
+           │               │              │
+           └───────────────┴──────────────┘
+                           │ 結果・スクリーンショット
+                           ▼
+                  ┌─────────────────┐
+                  │  Local Storage  │
+                  │  (スクリーン    │
+                  │  ショット/動画) │
+                  └─────────────────┘
+```
+
+**全コンポーネントを Docker Compose 1ファイルで管理**
+
+---
+
+## 3. 技術スタック
+
+| レイヤー | 技術 | 理由 |
+|---|---|---|
+| フロントエンド | Next.js 15 (App Router) + TypeScript + Tailwind CSS | フルスタック対応、学習コスト低 |
+| API Server | Node.js + TypeScript + Fastify | 高速、型安全 |
+| ORM | Prisma | マイグレーション管理が容易 |
+| DB | PostgreSQL 16 | 無料、信頼性高 |
+| Queue | Redis 7 + BullMQ | ジョブ管理・リトライ・並列制御 |
+| Web Runner | Playwright | Microsoft製、Chrome/FF/WebKit対応、無料 |
+| Android Runner | Appium 2 + UIAutomator2 | iOS不要、Linux上でエミュレータ動作 |
+| API Runner | Axios + JSON Schema | 軽量 |
+| リアルタイム | WebSocket (ws ライブラリ) | SSE代替、双方向通信 |
+| 認証 | JWT + Passport.js | シンプル、依存少 |
+| ビジュアル差分 | Pixelmatch + pngjs | OSSピクセル比較 |
+| ストレージ | ローカルファイルシステム (MVP) → MinIO (将来) | 初期コスト$0 |
+| コンテナ管理 | Docker Compose | Kubernetes不要 |
+
+---
+
+## 4. ディレクトリ構成
+
+```
+test-automation-tool/
+├── apps/
+│   ├── web/                    # Next.js フロントエンド
+│   │   ├── app/
+│   │   │   ├── (auth)/         # ログイン/登録ページ
+│   │   │   ├── dashboard/      # プロジェクト一覧
+│   │   │   ├── projects/
+│   │   │   │   └── [id]/
+│   │   │   │       ├── tests/          # テスト一覧
+│   │   │   │       │   └── [testId]/   # ステップエディタ
+│   │   │   │       ├── runs/           # 実行履歴
+│   │   │   │       │   └── [runId]/    # 実行詳細レポート
+│   │   │   │       └── settings/       # プロジェクト設定
+│   │   │   └── settings/       # チーム設定
+│   │   └── components/
+│   │       ├── step-editor/    # ステップエディタUI
+│   │       ├── run-report/     # 実行レポートUI
+│   │       └── visual-diff/    # ビジュアル差分UI
+│   │
+│   └── api/                    # Fastify API Server
+│       ├── src/
+│       │   ├── modules/
+│       │   │   ├── auth/       # 認証
+│       │   │   ├── projects/   # プロジェクト管理
+│       │   │   ├── tests/      # テスト管理
+│       │   │   ├── steps/      # ステップ管理
+│       │   │   ├── runs/       # 実行管理
+│       │   │   ├── reports/    # レポート
+│       │   │   └── team/       # チーム管理
+│       │   ├── queue/          # BullMQ ジョブ定義
+│       │   ├── websocket/      # WebSocket ハンドラ
+│       │   └── storage/        # ファイルストレージ
+│       └── prisma/
+│           └── schema.prisma
+│
+├── packages/
+│   ├── runner-core/            # 共通Runner基底クラス
+│   ├── runner-web/             # Playwright Runner
+│   ├── runner-android/         # Appium Runner
+│   ├── runner-api/             # API Runner
+│   └── types/                  # 共有型定義
+│
+├── chrome-extension/           # Record & Playback拡張機能
+│
+├── cli/                        # CLIツール (ローカル実行用)
+│
+├── docker/
+│   ├── docker-compose.yml      # 全サービス定義
+│   ├── docker-compose.dev.yml  # 開発用オーバーライド
+│   └── Dockerfile.*            # 各サービスのDockerfile
+│
+└── docs/
+    ├── requirements.md
+    └── architecture.md
 ```
 
 ---
 
-## 2. コンポーネント詳細
+## 5. データモデル (Prisma Schema)
 
-### 2.1 Web Dashboard (フロントエンド)
+```prisma
+// prisma/schema.prisma
 
-**技術スタック:** Next.js 15 (App Router) + TypeScript + Tailwind CSS
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  passwordHash  String?
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+  teamMembers   TeamMember[]
+  triggeredRuns TestRun[]
+}
 
-**主要画面:**
-- `/dashboard` - プロジェクト一覧・ヘルススコア
-- `/projects/:id/tests` - テスト一覧・管理
-- `/projects/:id/tests/:testId/edit` - ステップエディタ
-- `/projects/:id/runs` - 実行履歴・レポート
-- `/projects/:id/runs/:runId` - 実行詳細 (ステップ別結果)
-- `/projects/:id/settings` - プロジェクト設定
-- `/settings/team` - チームメンバー管理
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  members   TeamMember[]
+  projects  Project[]
+}
 
-**状態管理:** TanStack Query (サーバー状態) + Zustand (UI状態)
+model TeamMember {
+  team   Team   @relation(fields: [teamId], references: [id])
+  teamId String
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+  role   String // owner | editor | viewer
+  @@id([teamId, userId])
+}
 
-**リアルタイム:** WebSocket (実行ログのストリーミング)
+model Project {
+  id          String   @id @default(cuid())
+  team        Team     @relation(fields: [teamId], references: [id])
+  teamId      String
+  name        String
+  platform    String   // web | android | api
+  baseUrl     String?
+  appPackage  String?  // Android package name
+  createdAt   DateTime @default(now())
+  tests       Test[]
+  runs        TestRun[]
+  environments Environment[]
+  schedules   Schedule[]
+  apiTokens   ApiToken[]
+  sharedSteps SharedStep[]
+}
+
+model Environment {
+  id        String   @id @default(cuid())
+  project   Project  @relation(fields: [projectId], references: [id])
+  projectId String
+  name      String   // development | staging | production
+  variables Json     // { KEY: VALUE } (暗号化して保存)
+}
+
+model Test {
+  id          String   @id @default(cuid())
+  project     Project  @relation(fields: [projectId], references: [id])
+  projectId   String
+  name        String
+  description String?
+  tags        String[] // PostgreSQL配列
+  folderId    String?
+  status      String   @default("active") // active | archived
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  steps       TestStep[]
+  results     TestRunResult[]
+  dataSets    TestDataSet[]
+}
+
+model TestStep {
+  id           String   @id @default(cuid())
+  test         Test     @relation(fields: [testId], references: [id])
+  testId       String
+  order        Int
+  action       String   // navigate | click | input | assert_text ...
+  params       Json     // アクション固有のパラメータ
+  sharedStep   SharedStep? @relation(fields: [sharedStepId], references: [id])
+  sharedStepId String?
+  createdAt    DateTime @default(now())
+  stepResults  StepResult[]
+}
+
+model SharedStep {
+  id        String   @id @default(cuid())
+  project   Project  @relation(fields: [projectId], references: [id])
+  projectId String
+  name      String
+  steps     Json     // ステップ定義の配列
+  testSteps TestStep[]
+}
+
+model TestDataSet {
+  id        String @id @default(cuid())
+  test      Test   @relation(fields: [testId], references: [id])
+  testId    String
+  name      String
+  csvContent String
+}
+
+model TestRun {
+  id            String   @id @default(cuid())
+  project       Project  @relation(fields: [projectId], references: [id])
+  projectId     String
+  trigger       String   // manual | schedule | api | ci
+  status        String   // queued | running | passed | failed | cancelled
+  environment   String?
+  triggeredBy   User?    @relation(fields: [triggeredById], references: [id])
+  triggeredById String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime @default(now())
+  results       TestRunResult[]
+}
+
+model TestRunResult {
+  id            String   @id @default(cuid())
+  run           TestRun  @relation(fields: [runId], references: [id])
+  runId         String
+  test          Test     @relation(fields: [testId], references: [id])
+  testId        String
+  status        String   // passed | failed | skipped
+  durationMs    Int?
+  errorMessage  String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  stepResults   StepResult[]
+  videoUrl      String?
+}
+
+model StepResult {
+  id             String   @id @default(cuid())
+  runResult      TestRunResult @relation(fields: [runResultId], references: [id])
+  runResultId    String
+  step           TestStep @relation(fields: [stepId], references: [id])
+  stepId         String
+  order          Int
+  status         String   // passed | failed | skipped
+  screenshotPath String?
+  logText        String?
+  durationMs     Int?
+  executedAt     DateTime?
+  visualDiff     VisualDiff?
+  healingSuggestion HealingSuggestion?
+}
+
+model VisualBaseline {
+  id          String   @id @default(cuid())
+  projectId   String
+  testId      String
+  stepId      String
+  imagePath   String
+  createdAt   DateTime @default(now())
+  diffs       VisualDiff[]
+}
+
+model VisualDiff {
+  id             String        @id @default(cuid())
+  stepResult     StepResult    @relation(fields: [stepResultId], references: [id])
+  stepResultId   String        @unique
+  baseline       VisualBaseline @relation(fields: [baselineId], references: [id])
+  baselineId     String
+  diffImagePath  String?
+  diffPercentage Float
+  status         String        // pending | approved | rejected
+  createdAt      DateTime      @default(now())
+}
+
+model HealingSuggestion {
+  id               String     @id @default(cuid())
+  stepResult       StepResult @relation(fields: [stepResultId], references: [id])
+  stepResultId     String     @unique
+  originalSelector String
+  suggestedSelector String
+  confidence       Float
+  reason           String
+  status           String     // pending | accepted | rejected
+  createdAt        DateTime   @default(now())
+}
+
+model Schedule {
+  id             String   @id @default(cuid())
+  project        Project  @relation(fields: [projectId], references: [id])
+  projectId      String
+  name           String
+  cronExpression String
+  environmentId  String?
+  enabled        Boolean  @default(true)
+  lastRunAt      DateTime?
+  nextRunAt      DateTime?
+}
+
+model ApiToken {
+  id         String   @id @default(cuid())
+  project    Project  @relation(fields: [projectId], references: [id])
+  projectId  String
+  name       String
+  tokenHash  String   @unique
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+}
+```
 
 ---
 
-### 2.2 Core API
-
-**技術スタック:** Node.js + TypeScript + Fastify + Prisma ORM
-
-**主要エンドポイント:**
+## 6. API エンドポイント一覧
 
 ```
 # 認証
-POST   /auth/signup
-POST   /auth/login
-POST   /auth/logout
-POST   /auth/refresh
-GET    /auth/oauth/:provider      # Google / GitHub
-POST   /auth/saml                 # SAML SSO
-
-# プロジェクト
-GET    /projects
-POST   /projects
-GET    /projects/:id
-PATCH  /projects/:id
-DELETE /projects/:id
-
-# テスト
-GET    /projects/:id/tests
-POST   /projects/:id/tests
-GET    /projects/:id/tests/:testId
-PATCH  /projects/:id/tests/:testId
-DELETE /projects/:id/tests/:testId
-POST   /projects/:id/tests/:testId/duplicate
-
-# テストステップ
-GET    /projects/:id/tests/:testId/steps
-PUT    /projects/:id/tests/:testId/steps  # 全ステップ置換
-
-# 共有ステップ
-GET    /projects/:id/shared-steps
-POST   /projects/:id/shared-steps
-
-# テスト実行
-POST   /projects/:id/runs              # 実行開始
-GET    /projects/:id/runs
-GET    /projects/:id/runs/:runId
-DELETE /projects/:id/runs/:runId/cancel
-
-# 実行結果
-GET    /projects/:id/runs/:runId/steps  # ステップ別結果
-
-# ビジュアル差分
-GET    /projects/:id/runs/:runId/visual-diffs
-POST   /projects/:id/runs/:runId/visual-diffs/:diffId/approve
-
-# スケジュール
-GET    /projects/:id/schedules
-POST   /projects/:id/schedules
-PATCH  /projects/:id/schedules/:scheduleId
-DELETE /projects/:id/schedules/:scheduleId
+POST   /api/auth/signup
+POST   /api/auth/login
+POST   /api/auth/logout
+POST   /api/auth/refresh
+GET    /api/auth/me
 
 # チーム
-GET    /teams/:teamId/members
-POST   /teams/:teamId/invitations
-PATCH  /teams/:teamId/members/:userId/role
-DELETE /teams/:teamId/members/:userId
+GET    /api/teams/:teamId/members
+POST   /api/teams/:teamId/invitations
+PATCH  /api/teams/:teamId/members/:userId
+DELETE /api/teams/:teamId/members/:userId
 
-# Webhook / CI連携
-GET    /projects/:id/api-token
-POST   /projects/:id/api-token/rotate
-POST   /v1/runs                   # 外部CIからのトリガー (API token認証)
-GET    /v1/runs/:runId            # 実行結果ポーリング
+# プロジェクト
+GET    /api/projects
+POST   /api/projects
+GET    /api/projects/:id
+PATCH  /api/projects/:id
+DELETE /api/projects/:id
+
+# 環境変数
+GET    /api/projects/:id/environments
+POST   /api/projects/:id/environments
+PATCH  /api/projects/:id/environments/:envId
+DELETE /api/projects/:id/environments/:envId
+
+# テスト
+GET    /api/projects/:id/tests
+POST   /api/projects/:id/tests
+GET    /api/projects/:id/tests/:testId
+PATCH  /api/projects/:id/tests/:testId
+DELETE /api/projects/:id/tests/:testId
+POST   /api/projects/:id/tests/:testId/duplicate
+
+# ステップ
+GET    /api/projects/:id/tests/:testId/steps
+PUT    /api/projects/:id/tests/:testId/steps  # 全置換
+
+# 共有ステップ
+GET    /api/projects/:id/shared-steps
+POST   /api/projects/:id/shared-steps
+PATCH  /api/projects/:id/shared-steps/:stepId
+DELETE /api/projects/:id/shared-steps/:stepId
+
+# テストデータセット
+GET    /api/projects/:id/tests/:testId/data-sets
+POST   /api/projects/:id/tests/:testId/data-sets
+
+# 実行
+POST   /api/projects/:id/runs           # 実行開始
+GET    /api/projects/:id/runs           # 実行履歴一覧
+GET    /api/projects/:id/runs/:runId    # 実行詳細
+DELETE /api/projects/:id/runs/:runId/cancel
+
+# 実行結果
+GET    /api/projects/:id/runs/:runId/results              # テスト単位の結果
+GET    /api/projects/:id/runs/:runId/results/:resultId/steps  # ステップ単位の結果
+
+# ビジュアル差分
+GET    /api/projects/:id/runs/:runId/visual-diffs
+POST   /api/projects/:id/visual-diffs/:diffId/approve
+POST   /api/projects/:id/visual-diffs/:diffId/reject
+POST   /api/projects/:id/visual-baselines/:baselineId/update
+
+# セルフヒーリング
+GET    /api/projects/:id/runs/:runId/healing-suggestions
+POST   /api/healing-suggestions/:id/accept
+POST   /api/healing-suggestions/:id/reject
+
+# スケジュール
+GET    /api/projects/:id/schedules
+POST   /api/projects/:id/schedules
+PATCH  /api/projects/:id/schedules/:scheduleId
+DELETE /api/projects/:id/schedules/:scheduleId
+
+# APIトークン
+GET    /api/projects/:id/api-tokens
+POST   /api/projects/:id/api-tokens
+DELETE /api/projects/:id/api-tokens/:tokenId
+
+# CI/CD向け外部API (APIトークン認証)
+POST   /api/v1/runs
+GET    /api/v1/runs/:runId
+
+# 静的ファイル (スクリーンショット等)
+GET    /api/files/:projectId/:filename
 ```
 
 ---
 
-### 2.3 Execution API
-
-**技術スタック:** Node.js + TypeScript + Fastify
-
-**責務:**
-- ジョブの BullMQ キューへのエンキュー
-- Runner からの結果受信・DB保存
-- WebSocket でフロントへリアルタイムログ配信
-- スクリーンショット・動画のオブジェクトストレージへのアップロード
-
----
-
-### 2.4 AI Service
-
-**技術スタック:** Python + FastAPI + Claude API (claude-opus-4-6)
-
-**機能:**
-
-#### 自然言語 → テストステップ変換
-```python
-# Input
-{
-  "instruction": "ログインページでメールとパスワードを入力してログインする",
-  "platform": "web",
-  "context": { "current_url": "https://example.com/login" }
-}
-
-# Output
-{
-  "steps": [
-    { "action": "input", "selector": "input[type=email]", "value": "{{email}}" },
-    { "action": "input", "selector": "input[type=password]", "value": "{{password}}" },
-    { "action": "click", "selector": "button[type=submit]" },
-    { "action": "assert_url", "expected": "https://example.com/dashboard" }
-  ]
-}
-```
-
-#### セルフヒーリング
-```python
-# Input
-{
-  "failed_step": { "action": "click", "selector": "#login-btn" },
-  "error": "Element not found: #login-btn",
-  "page_snapshot": "<html>...</html>",
-  "screenshot": "base64..."
-}
-
-# Output
-{
-  "healed_step": { "action": "click", "selector": "button[data-testid=login-button]" },
-  "confidence": 0.95,
-  "reason": "ボタンのIDが変更されましたが、同じ役割・位置・テキストを持つ要素を発見しました"
-}
-```
-
----
-
-### 2.5 Test Runners
-
-#### Web Runner (Playwright)
-- Docker イメージ: `mcr.microsoft.com/playwright:latest`
-- 対応ブラウザ: chromium / firefox / webkit
-- 並列実行: コンテナごとに1テスト
-- ステップ実行エンジン:
-  ```
-  step → Playwrightアクション変換 → 実行 → スクリーンショット → 結果送信
-  ```
-
-#### Mobile Runner (Appium)
-- Docker イメージ: カスタムビルド (Appium 2 + XCUITest / UIAutomator2)
-- iOS: Mac Miniクラスタ (macOS必須) または SauceLabs/BrowserStack連携
-- Android: Android エミュレータ (Linux KVM)
-- デバイスファーム管理
-
-#### API Runner
-- 軽量コンテナ (Node.js)
-- HTTP クライアント: Axios
-- JSON Schema バリデーション
-- OAuth2 / JWT 取得フロー対応
-
----
-
-## 3. データモデル
-
-```sql
--- ユーザー・チーム
-users (id, email, name, avatar_url, created_at)
-teams (id, name, plan, created_at)
-team_members (team_id, user_id, role: owner|admin|editor|viewer)
-invitations (id, team_id, email, role, token, expires_at)
-
--- プロジェクト
-projects (id, team_id, name, platform: web|ios|android|api, 
-          base_url, app_package, settings_json, created_at)
-environments (id, project_id, name, variables_json)  -- 本番/ステージング/開発
-
--- テスト
-tests (id, project_id, name, description, tags, 
-       folder_id, status: active|archived, created_at, updated_at)
-test_steps (id, test_id, order, action, params_json, 
-            shared_step_id, created_at)
-shared_steps (id, project_id, name, steps_json)
-test_data_sets (id, test_id, name, csv_content)  -- データドリブン用
-
--- 実行
-test_runs (id, project_id, trigger: manual|schedule|api|ci,
-           status: queued|running|passed|failed|cancelled,
-           started_at, finished_at, triggered_by_user_id)
-test_run_results (id, run_id, test_id, status, duration_ms,
-                  error_message, started_at, finished_at)
-step_results (id, run_result_id, step_id, order, status,
-              screenshot_url, video_clip_url, log_text,
-              duration_ms, executed_at)
-
--- ビジュアルリグレッション
-visual_baselines (id, project_id, test_id, step_id,
-                  image_url, created_at)
-visual_diffs (id, step_result_id, baseline_id,
-              diff_image_url, diff_percentage,
-              status: pending|approved|rejected)
-
--- セルフヒーリング
-healing_suggestions (id, step_result_id, original_selector,
-                     suggested_selector, confidence,
-                     reason, status: pending|accepted|rejected,
-                     created_at)
-
--- スケジュール
-schedules (id, project_id, name, cron_expression,
-           environment_id, enabled, last_run_at, next_run_at)
-
--- CI/CD
-api_tokens (id, project_id, name, token_hash, last_used_at, created_at)
-webhooks (id, project_id, url, events_json, secret)
-```
-
----
-
-## 4. テスト定義スキーマ (YAML形式)
+## 7. テスト定義 YAML スキーマ
 
 ```yaml
-# test-definition.yaml
 version: "1.0"
-id: "test-login-flow"
-name: "ログインフローのテスト"
-platform: web
+id: "test-login"
+name: "ログインフロー"
+platform: web  # web | android | api
 tags: [smoke, auth]
 
-# データドリブン設定
+# データドリブン (省略可)
 data_sets:
-  - name: "正常ユーザー"
+  - name: "一般ユーザー"
     variables:
-      email: "user@example.com"
-      password: "password123"
-  - name: "管理者ユーザー"
-    variables:
-      email: "admin@example.com"
-      password: "adminpass"
+      email: user@example.com
+      password: pass123
 
 steps:
   - action: navigate
@@ -312,20 +479,20 @@ steps:
   - action: input
     selector: "input[type=password]"
     value: "{{password}}"
-    secret: true
+    secret: true                  # ログに出力しない
 
   - action: click
     selector: "button[type=submit]"
-    wait_for: navigation
+    wait_for: navigation          # ナビゲーション完了まで待機
 
   - action: assert_text
-    selector: ".welcome-message"
-    expected: "ようこそ"
-    mode: contains
+    selector: "h1"
+    expected: "ダッシュボード"
+    mode: contains                # exact | contains | regex
 
   - action: screenshot
-    name: "ログイン後のホーム画面"
-    visual_regression: true
+    name: "ログイン後"
+    visual_regression: true       # ビジュアルリグレッション有効
 
   - action: shared_step
     id: "logout-flow"
@@ -333,142 +500,97 @@ steps:
 
 ---
 
-## 5. ステップアクション定義
+## 8. Runner 実行フロー
 
-### Web / 共通アクション
+```
+[API Server]
+  POST /api/projects/:id/runs
+  → TestRun レコード作成 (status: queued)
+  → BullMQ にジョブをエンキュー
+  → 202 Accepted { runId }
 
-| カテゴリ | アクション | 説明 |
+[BullMQ Worker]
+  ジョブ取得
+  → TestRun status: running に更新
+  → WebSocket でフロントに通知
+
+  For each Test in suite:
+    → Runnerコンテナ起動 (or 既存コンテナにジョブ送信)
+    → TestRunResult レコード作成
+
+    For each Step:
+      → ステップ実行
+      → スクリーンショット保存
+      → StepResult レコード作成
+      → WebSocket でリアルタイムログ配信
+
+      失敗時:
+        → セルフヒーリング候補を生成
+        → HealingSuggestion レコード作成
+
+      ビジュアルアサーション時:
+        → ベースラインと比較 (pixelmatch)
+        → VisualDiff レコード作成
+
+  → TestRun status: passed | failed に更新
+  → WebSocket で完了通知
+  → Slack通知 (設定時)
+```
+
+---
+
+## 9. Docker Compose 構成
+
+```yaml
+# docker-compose.yml
+services:
+  web:                    # Next.js フロントエンド
+    build: ./apps/web
+    ports: ["3000:3000"]
+
+  api:                    # Fastify API Server
+    build: ./apps/api
+    ports: ["4000:4000"]
+    depends_on: [postgres, redis]
+    volumes:
+      - ./storage:/app/storage  # スクリーンショット保存先
+
+  postgres:
+    image: postgres:16-alpine
+    volumes: [postgres_data:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:7-alpine
+
+  runner-web:             # Playwright Runner
+    build: ./packages/runner-web
+    depends_on: [api, redis]
+    # Playwrightのブラウザ同梱
+
+  runner-android:         # Appium Runner (オプション)
+    build: ./packages/runner-android
+    devices:              # Android エミュレータ
+      - /dev/kvm:/dev/kvm
+    depends_on: [api, redis]
+
+  runner-api:             # API Runner
+    build: ./packages/runner-api
+    depends_on: [api, redis]
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 10. コスト比較
+
+| 項目 | 本ツール (MVP) | MagicPod |
 |---|---|---|
-| ナビゲーション | `navigate` | URLに移動 |
-| ナビゲーション | `go_back` / `go_forward` | ブラウザ履歴 |
-| クリック | `click` | 要素をクリック |
-| クリック | `double_click` | ダブルクリック |
-| クリック | `right_click` | 右クリック |
-| 入力 | `input` | テキスト入力 |
-| 入力 | `clear` | 入力クリア |
-| 入力 | `select` | ドロップダウン選択 |
-| 入力 | `upload_file` | ファイルアップロード |
-| スクロール | `scroll` | スクロール |
-| スクロール | `scroll_to_element` | 要素までスクロール |
-| アサーション | `assert_text` | テキスト確認 |
-| アサーション | `assert_visible` | 表示確認 |
-| アサーション | `assert_hidden` | 非表示確認 |
-| アサーション | `assert_url` | URL確認 |
-| アサーション | `assert_attribute` | 属性確認 |
-| アサーション | `assert_count` | 要素数確認 |
-| 待機 | `wait` | 固定待機 (ms) |
-| 待機 | `wait_for_element` | 要素出現待機 |
-| 待機 | `wait_for_network` | ネットワーク完了待機 |
-| キャプチャ | `screenshot` | スクリーンショット |
-| 変数 | `set_variable` | 変数セット |
-| 変数 | `extract_text` | テキスト抽出→変数 |
-| 変数 | `extract_attribute` | 属性抽出→変数 |
-| 制御 | `if` / `else` / `end_if` | 条件分岐 |
-| 制御 | `loop` / `end_loop` | ループ |
-| 制御 | `shared_step` | 共有ステップ呼び出し |
-| API | `api_request` | HTTPリクエスト送信 |
-| ユーティリティ | `generate_totp` | TOTP生成 |
-| ユーティリティ | `date_format` | 日付フォーマット |
-| ユーティリティ | `regex_extract` | 正規表現抽出 |
-
-### モバイル固有アクション
-
-| アクション | 説明 |
-|---|---|
-| `tap` | タップ |
-| `long_press` | 長押し |
-| `swipe` | スワイプ (方向指定) |
-| `pinch` | ピンチイン/アウト |
-| `drag_and_drop` | ドラッグ&ドロップ |
-| `rotate` | デバイス回転 |
-| `shake` | シェイク |
-| `press_key` | ハードウェアキー操作 |
-| `assert_image` | 画像認識アサーション |
-| `launch_app` | アプリ起動 |
-| `kill_app` | アプリ終了 |
-| `reset_app` | アプリリセット |
-
----
-
-## 6. CI/CD連携フロー
-
-```
-# GitHub Actions の例
-jobs:
-  e2e-test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Run E2E Tests
-        uses: your-tool/run-tests@v1
-        with:
-          api-token: ${{ secrets.E2E_API_TOKEN }}
-          project-id: proj_abc123
-          test-suite: smoke
-          environment: staging
-          wait-for-result: true
-          fail-on-failure: true
-```
-
-**APIトリガーフロー:**
-```
-CI → POST /v1/runs { project_id, suite, env }
-   → 202 Accepted { run_id }
-   → polling GET /v1/runs/:run_id (or webhook)
-   → { status: "passed" | "failed", report_url }
-```
-
----
-
-## 7. 技術スタック まとめ
-
-| レイヤー | 技術 |
-|---|---|
-| フロントエンド | Next.js 15, TypeScript, Tailwind CSS, TanStack Query, Zustand |
-| Core API | Node.js, TypeScript, Fastify, Prisma, Zod |
-| AI Service | Python, FastAPI, Claude API (claude-opus-4-6) |
-| Web Runner | Node.js, Playwright, Docker |
-| Mobile Runner | Java/Node.js, Appium 2, Docker (Android) / Mac Mini (iOS) |
-| API Runner | Node.js, Axios |
-| Queue | Redis 7 + BullMQ |
-| DB | PostgreSQL 16 |
-| Object Storage | MinIO (self-hosted) / AWS S3 |
-| Auth | JWT (access/refresh) + Passport.js |
-| リアルタイム | WebSocket (ws / Socket.IO) |
-| インフラ | Docker Compose (dev) / Kubernetes (prod) |
-| モニタリング | Prometheus + Grafana |
-| ログ | Loki + Grafana |
-
----
-
-## 8. 開発フェーズ計画
-
-### Phase 1: Core (MVP)
-- [ ] Core API (プロジェクト/テスト/実行 CRUD)
-- [ ] PostgreSQL スキーマ + Prisma
-- [ ] Web Runner (Playwright, 基本アクション30種)
-- [ ] Web Dashboard (テスト一覧・ステップエディタ・実行・レポート)
-- [ ] メール認証
-
-### Phase 2: 品質向上
-- [ ] ビジュアルリグレッションテスト
-- [ ] データドリブンテスト (CSV)
-- [ ] 共有ステップ
-- [ ] スケジュール実行
-- [ ] Slack通知
-
-### Phase 3: モバイル対応
-- [ ] Android Runner (Appium)
-- [ ] iOS Runner (Appium + Mac Mini)
-- [ ] モバイルレコード機能
-
-### Phase 4: AI機能
-- [ ] AI Autopilot (自然言語→テスト生成)
-- [ ] セルフヒーリング
-- [ ] Flaky Test検出
-
-### Phase 5: エンタープライズ
-- [ ] SAML SSO
-- [ ] RBAC強化
-- [ ] API Gateway (Rate Limiting)
-- [ ] マルチリージョン対応
-- [ ] Audit Log
+| ライセンス | $0 (全OSS) | $400〜/月 |
+| Web実行インフラ | $0〜$20/月 (VPS) | 込み |
+| Android実行 | $0 (自前エミュレータ) | 込み |
+| iOS実行 | 非対応 (将来) | 込み |
+| ストレージ | $0 (ローカル) | 込み |
+| AI機能 | Claude API従量課金 | 込み |
+| **合計** | **$0〜$20/月** | **$400〜/月** |
