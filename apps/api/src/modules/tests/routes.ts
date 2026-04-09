@@ -210,6 +210,43 @@ export const testRoutes: FastifyPluginAsync = async (app) => {
     });
     return reply.code(201).send({ data: sharedStep });
   });
+
+  // PATCH /api/projects/:projectId/shared-steps/:sharedStepId
+  app.patch("/:projectId/shared-steps/:sharedStepId", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId, sharedStepId } = request.params as { projectId: string; sharedStepId: string };
+    const userId = (request.user as { sub: string }).sub;
+
+    if (!(await canEditProject(projectId, userId))) {
+      return reply.code(403).send({ error: "Forbidden", message: "Insufficient permissions", statusCode: 403 });
+    }
+
+    const body = z.object({ name: z.string().min(1).optional(), steps: z.array(stepSchema).optional() }).safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "Bad Request", message: body.error.message, statusCode: 400 });
+    }
+
+    const updated = await prisma.sharedStep.update({
+      where: { id: sharedStepId },
+      data: {
+        ...(body.data.name && { name: body.data.name }),
+        ...(body.data.steps && { steps: body.data.steps }),
+      },
+    });
+    return reply.send({ data: updated });
+  });
+
+  // DELETE /api/projects/:projectId/shared-steps/:sharedStepId
+  app.delete("/:projectId/shared-steps/:sharedStepId", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId, sharedStepId } = request.params as { projectId: string; sharedStepId: string };
+    const userId = (request.user as { sub: string }).sub;
+
+    if (!(await canEditProject(projectId, userId))) {
+      return reply.code(403).send({ error: "Forbidden", message: "Insufficient permissions", statusCode: 403 });
+    }
+
+    await prisma.sharedStep.delete({ where: { id: sharedStepId } });
+    return reply.code(204).send();
+  });
 };
 
 async function canAccessProject(projectId: string, userId: string): Promise<boolean> {

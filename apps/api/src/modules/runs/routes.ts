@@ -222,7 +222,115 @@ export const runRoutes: FastifyPluginAsync = async (app) => {
     await prisma.visualDiff.update({ where: { id }, data: { status: "approved" } });
     return reply.send({ data: { ok: true } });
   });
+
+  // POST /api/visual-diffs/:id/reject
+  app.post("/visual-diffs/:id/reject", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    await prisma.visualDiff.update({ where: { id }, data: { status: "rejected" } });
+    return reply.send({ data: { ok: true } });
+  });
+
+  // POST /api/visual-baselines/:id/update — promote current screenshot as new baseline
+  app.post("/visual-baselines/:id/update", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = request.body as { newImageUrl: string };
+
+    const baseline = await prisma.visualBaseline.findUnique({ where: { id } });
+    if (!baseline) {
+      return reply.code(404).send({ error: "Not Found", message: "Baseline not found", statusCode: 404 });
+    }
+
+    // Derive relative storage path from URL: /api/files/<path> → <path>
+    const relativePath = body.newImageUrl.replace(/^\/api\/files\//, "");
+    await prisma.visualBaseline.update({ where: { id }, data: { imagePath: relativePath } });
+    return reply.send({ data: { ok: true } });
+  });
+
+  // GET /api/projects/:projectId/analytics/flaky — top flaky tests
+  app.get("/projects/:projectId/analytics/flaky", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const userId = (request.user as { sub: string }).sub;
+
+    if (!(await canAccessProject(projectId, userId))) {
+      return reply.code(403).send({ error: "Forbidden", message: "Access denied", statusCode: 403 });
+    }
+
+    // Look at the last 30 days of results grouped by testId
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const results = await prisma.testRunResult.findMany({
+      where: {
+        run: { projectId, createdAt: { gte: since } },
+        status: { in: ["passed", "failed"] },
+      },
+      select: { testId: true, status: true },
+    });
+
+    const byTest = new Map<string, { passed: number; failed: number }>();
+    for (const r of results) {
+      const entry = byTest.get(r.testId) ?? { passed: 0, failed: 0 };
+      if (r.status === "passed") entry.passed++;
+      else entry.failed++;
+      byTest.set(r.testId, entry);
+    }
+
+    // Calculate flakiness: tests that both passed AND failed (at least once each)
+    const flaky: { testId: string; passed: number; failed: number; total: number; failRate: number }[] = [];
+    for (const [testId, counts] of byTest) {
+      if (counts.passed > 0 && counts.failed > 0) {
+        const total = counts.passed + counts.failed;
+        flaky.push({ testId, ...counts, total, failRate: counts.failed / total });
+      }
+    }
+
+    flaky.sort((a, b) => b.failRate - a.failRate);
+
+    // Attach test names
+    const testIds = flaky.map((f) => f.testId);
+    const tests = await prisma.test.findMany({ where: { id: { in: testIds } }, select: { id: true, name: true } });
+    const testMap = new Map(tests.map((t) => [t.id, t.name]));
+
+    return reply.send({
+      data: flaky.map((f) => ({ ...f, testName: testMap.get(f.testId) ?? f.testId })),
+    });
+  });
+
+  // GET /api/projects/:projectId/tests/:testId/datasets
+  app.get("/projects/:projectId/tests/:testId/datasets", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId, testId } = request.params as { projectId: string; testId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const datasets = await prisma.testDataSet.findMany({ where: { testId } });
+    return reply.send({ data: datasets });
+  });
+
+  // POST /api/projects/:projectId/tests/:testId/datasets
+  app.post("/projects/:projectId/tests/:testId/datasets", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId, testId } = request.params as { projectId: string; testId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const body = z.object({ name: z.string().min(1), csvContent: z.string().min(1) }).safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: "Bad Request", message: body.error.message, statusCode: 400 });
+
+    const dataset = await prisma.testDataSet.create({
+      data: { testId, name: body.data.name, csvContent: body.data.csvContent },
+    });
+    return reply.code(201).send({ data: dataset });
+  });
+
+  // DELETE /api/projects/:projectId/tests/:testId/datasets/:datasetId
+  app.delete("/projects/:projectId/tests/:testId/datasets/:datasetId", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId, datasetId } = request.params as { projectId: string; testId: string; datasetId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    await prisma.testDataSet.delete({ where: { id: datasetId } });
+    return reply.code(204).send();
+  });
 };
+
+const forbidden = () => ({ error: "Forbidden", message: "Access denied", statusCode: 403 });
 
 async function createRun(
   projectId: string,

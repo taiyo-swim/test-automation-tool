@@ -19,9 +19,10 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Plus, Play, Save, ArrowLeft, GripVertical, Trash2, ChevronDown } from "lucide-react";
+import { Plus, Play, Save, ArrowLeft, GripVertical, Trash2, ChevronDown, Database } from "lucide-react";
 import { api } from "../../../../../../../lib/api";
 import type { Test, TestStep, StepAction } from "@e2e-tool/types";
+import { DatasetTab } from "../../../../../../../components/test/dataset-tab";
 import clsx from "clsx";
 
 // Minimal step form state (local)
@@ -106,6 +107,7 @@ export default function TestEditPage() {
   const [steps, setSteps] = useState<LocalStep[]>([]);
   const [dirty, setDirty] = useState(false);
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"steps" | "data">("steps");
 
   useEffect(() => {
     if (test?.steps) {
@@ -212,39 +214,68 @@ export default function TestEditPage() {
         </button>
       </div>
 
-      {/* Step List */}
-      <div className="flex-1 overflow-auto p-5 space-y-2">
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-          <SortableContext items={steps.map((s) => s.id)} strategy={verticalListSortingStrategy}>
-            {steps.map((step, index) => (
-              <StepCard
-                key={step.id}
-                step={step}
-                index={index}
-                expanded={expandedStep === step.id}
-                onToggleExpand={() => setExpandedStep((prev) => (prev === step.id ? null : step.id))}
-                onUpdate={(updates) => updateStep(step.id, updates)}
-                onRemove={() => removeStep(step.id)}
-              />
-            ))}
-          </SortableContext>
-        </DndContext>
-
-        {steps.length === 0 && (
-          <div className="text-center py-12 text-gray-400">
-            <p className="text-sm">ステップがありません</p>
-            <p className="text-xs mt-1">「ステップを追加」から追加してください</p>
-          </div>
-        )}
-
+      {/* Tabs */}
+      <div className="bg-white border-b border-gray-200 px-4 flex gap-1">
         <button
-          onClick={addStep}
-          className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-gray-300 rounded-xl text-sm text-gray-500 hover:border-primary-400 hover:text-primary-600 transition-colors"
+          onClick={() => setActiveTab("steps")}
+          className={clsx(
+            "px-3 py-2 text-xs font-medium border-b-2 transition-colors",
+            activeTab === "steps" ? "border-primary-600 text-primary-700" : "border-transparent text-gray-500 hover:text-gray-700"
+          )}
         >
-          <Plus size={15} />
-          ステップを追加
+          ステップ
+        </button>
+        <button
+          onClick={() => setActiveTab("data")}
+          className={clsx(
+            "flex items-center gap-1 px-3 py-2 text-xs font-medium border-b-2 transition-colors",
+            activeTab === "data" ? "border-primary-600 text-primary-700" : "border-transparent text-gray-500 hover:text-gray-700"
+          )}
+        >
+          <Database size={11} />
+          データセット
         </button>
       </div>
+
+      {activeTab === "data" ? (
+        <div className="flex-1 overflow-auto">
+          <DatasetTab projectId={projectId} testId={testId} />
+        </div>
+      ) : (
+        /* Step List */
+        <div className="flex-1 overflow-auto p-5 space-y-2">
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={steps.map((s) => s.id)} strategy={verticalListSortingStrategy}>
+              {steps.map((step, index) => (
+                <StepCard
+                  key={step.id}
+                  step={step}
+                  index={index}
+                  expanded={expandedStep === step.id}
+                  onToggleExpand={() => setExpandedStep((prev) => (prev === step.id ? null : step.id))}
+                  onUpdate={(updates) => updateStep(step.id, updates)}
+                  onRemove={() => removeStep(step.id)}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+
+          {steps.length === 0 && (
+            <div className="text-center py-12 text-gray-400">
+              <p className="text-sm">ステップがありません</p>
+              <p className="text-xs mt-1">「ステップを追加」から追加してください</p>
+            </div>
+          )}
+
+          <button
+            onClick={addStep}
+            className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-gray-300 rounded-xl text-sm text-gray-500 hover:border-primary-400 hover:text-primary-600 transition-colors"
+          >
+            <Plus size={15} />
+            ステップを追加
+          </button>
+        </div>
+      )}
     </div>
   );
 }

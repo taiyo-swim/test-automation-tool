@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, FlaskConical, Play, Settings } from "lucide-react";
+import { ChevronRight, FlaskConical, Play, Settings, Calendar, Layers, BarChart2 } from "lucide-react";
 import { api } from "../../../../lib/api";
 import type { Project } from "@e2e-tool/types";
 import clsx from "clsx";
@@ -20,6 +20,9 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
   const tabs = [
     { href: `/projects/${projectId}/tests`, label: "テスト", icon: FlaskConical },
     { href: `/projects/${projectId}/runs`, label: "実行履歴", icon: Play },
+    { href: `/projects/${projectId}/schedules`, label: "スケジュール", icon: Calendar },
+    { href: `/projects/${projectId}/shared-steps`, label: "共有ステップ", icon: Layers },
+    { href: `/projects/${projectId}/analytics`, label: "分析", icon: BarChart2 },
     { href: `/projects/${projectId}/settings`, label: "設定", icon: Settings },
   ];
 

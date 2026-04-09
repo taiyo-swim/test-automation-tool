@@ -12,9 +12,11 @@ import { testRoutes } from "./modules/tests/routes.js";
 import { runRoutes } from "./modules/runs/routes.js";
 import { teamRoutes } from "./modules/teams/routes.js";
 import { internalRoutes } from "./modules/internal/routes.js";
+import { scheduleRoutes } from "./modules/schedules/routes.js";
 import { wsHandler } from "./websocket/handler.js";
 import { startWorkers } from "./queue/workers.js";
 import { setupStorage } from "./storage/index.js";
+import { startScheduler } from "./scheduler/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,6 +68,7 @@ export async function buildApp() {
   await app.register(runRoutes, { prefix: "/api" });
   await app.register(teamRoutes, { prefix: "/api/teams" });
   await app.register(internalRoutes, { prefix: "/internal" });
+  await app.register(scheduleRoutes, { prefix: "/api/projects" });
 
   // WebSocket
   app.get("/ws", { websocket: true }, wsHandler);
@@ -73,8 +76,9 @@ export async function buildApp() {
   // Health check
   app.get("/health", async () => ({ status: "ok", timestamp: new Date().toISOString() }));
 
-  // ── Workers ────────────────────────────────────────────────────────
+  // ── Workers & Scheduler ────────────────────────────────────────────
   await startWorkers();
+  startScheduler();
 
   // ── Graceful Shutdown ──────────────────────────────────────────────
   app.addHook("onClose", async () => {

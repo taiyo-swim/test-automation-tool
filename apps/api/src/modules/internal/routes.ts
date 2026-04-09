@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { prisma } from "../../db.js";
 import { broadcast } from "../../websocket/handler.js";
 import { saveFile } from "../../storage/index.js";
+import { notifySlack } from "../../notifications/slack.js";
 import type { WsEvent } from "@e2e-tool/types";
 
 /**
@@ -47,6 +48,30 @@ export const internalRoutes: FastifyPluginAsync = async (app) => {
           }),
       },
     });
+
+    // Slack notification on run completion
+    if (body.status === "passed" || body.status === "failed" || body.status === "cancelled") {
+      const run = await prisma.testRun.findUnique({
+        where: { id: runId },
+        include: { results: { select: { status: true } } },
+      });
+      if (run && process.env.SLACK_WEBHOOK_URL) {
+        const startedAt = run.startedAt ? run.startedAt.getTime() : Date.now();
+        const finishedAt = run.finishedAt ? run.finishedAt.getTime() : Date.now();
+        notifySlack({
+          runId,
+          projectId: run.projectId,
+          status: body.status as "passed" | "failed" | "cancelled",
+          trigger: run.trigger,
+          totalTests: run.results.length,
+          passedTests: run.results.filter((r) => r.status === "passed").length,
+          failedTests: run.results.filter((r) => r.status === "failed").length,
+          durationMs: finishedAt - startedAt,
+          appUrl: process.env.APP_URL ?? "http://localhost:3000",
+        }).catch(() => {}); // fire-and-forget
+      }
+    }
+
     return reply.send({ ok: true });
   });
 
