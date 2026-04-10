@@ -1,0 +1,71 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRAuth",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPush",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:CompleteLayerUpload",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": [
+        "arn:aws:ecr:*:*:repository/e2e-tool/*"
+      ]
+    },
+    {
+      "Sid": "ECSDescribe",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECSDeployAndMigrate",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:UpdateService",
+        "ecs:RunTask"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:cluster/e2e-tool-cluster",
+        "arn:aws:ecs:*:*:service/e2e-tool-cluster/*",
+        "arn:aws:ecs:*:*:task-definition/e2e-tool-*"
+      ]
+    },
+    {
+      "Sid": "PassECSRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::*:role/e2e-tool-ecs-execution-role",
+        "arn:aws:iam::*:role/e2e-tool-*-task-role"
+      ]
+    },
+    {
+      "Sid": "CloudFormationRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStacks"
+      ],
+      "Resource": "arn:aws:cloudformation:*:*:stack/e2e-tool-*/*"
+    }
+  ]
+}

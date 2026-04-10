@@ -1,0 +1,291 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deploy even without code changes"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false  # Never cancel in-flight deploys
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_PREFIX: e2e-tool
+  ECS_CLUSTER: e2e-tool-cluster
+
+jobs:
+  # ── 1. Build & push Docker images to ECR ────────────────────────────────
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC for AWS
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/api:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build & push Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.web
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/web:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Build & push Runner image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.runner-web
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/runner-web:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/runner-web:latest
+          cache-from: type=gha,scope=runner
+          cache-to: type=gha,mode=max,scope=runner
+
+  # ── 2. Run DB migrations via ECS run-task ───────────────────────────────
+  migrate:
+    name: DB Migration
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Prisma migrate deploy
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition e2e-tool-api \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          # Override the command to run migrations only
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --network-configuration "$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services e2e-tool-api \
+              --query 'services[0].networkConfiguration' \
+              --output json)" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["sh","-c","npx prisma migrate deploy"]}]}' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "Migration task: $TASK_ARN"
+
+          # Wait for task to complete (max 5 minutes)
+          aws ecs wait tasks-stopped \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed with exit code $EXIT_CODE"
+            exit 1
+          fi
+          echo "✅ Migration completed successfully"
+
+  # ── 3. Deploy ECS services ───────────────────────────────────────────────
+  deploy:
+    name: Deploy Services
+    runs-on: ubuntu-latest
+    needs: [build, migrate]
+    permissions:
+      id-token: write
+      contents: read
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update API service
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/api:${{ needs.build.outputs.image_tag }}"
+
+          # Get current task definition and update image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition e2e-tool-api \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | \
+            jq --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service e2e-tool-api \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment
+
+          echo "API service updated to $IMAGE"
+
+      - name: Update Web service
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/web:${{ needs.build.outputs.image_tag }}"
+
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition e2e-tool-web \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | \
+            jq --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service e2e-tool-web \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment
+
+          echo "Web service updated to $IMAGE"
+
+      - name: Update Runner service
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_PREFIX }}/runner-web:${{ needs.build.outputs.image_tag }}"
+
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition e2e-tool-runner-web \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | \
+            jq --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service e2e-tool-runner-web \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment
+
+          echo "Runner service updated to $IMAGE"
+
+      - name: Wait for services to stabilize
+        run: |
+          echo "Waiting for API service..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services e2e-tool-api
+
+          echo "Waiting for Web service..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services e2e-tool-web
+
+          echo "Waiting for Runner service..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services e2e-tool-runner-web
+
+          echo "✅ All services deployed successfully"
+
+      - name: Health check
+        run: |
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name e2e-tool-ecs \
+            --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].OutputValue' \
+            --output text)
+
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "[$i/5] Health check returned HTTP $STATUS, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "❌ Health check failed after 5 retries"
+          exit 1
