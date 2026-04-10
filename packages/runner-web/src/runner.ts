@@ -21,7 +21,7 @@ import os from "os";
 import fs from "fs/promises";
 
 export async function executeRun(jobData: RunJobData) {
-  const { runId, projectId, testIds, environment } = jobData;
+  const { runId, projectId, testIds, environment, parallelism = 1 } = jobData;
 
   await updateRunStatus(runId, "running");
   await broadcastWs(runId, { type: "run:started", runId, payload: { status: "running" } });
@@ -29,10 +29,14 @@ export async function executeRun(jobData: RunJobData) {
   const envVars = await fetchEnvironmentVariables(projectId, environment);
   let overallStatus: "passed" | "failed" = "passed";
 
-  for (const testId of testIds) {
-    const status = await runTest(runId, testId, envVars);
-    if (status !== "passed") overallStatus = "failed";
-  }
+  // Run tests with bounded parallelism using a semaphore-style pool
+  const pool = new ParallelPool(parallelism);
+  const statuses = await Promise.all(
+    testIds.map((testId) =>
+      pool.run(() => runTestWithRetry(runId, testId, envVars))
+    )
+  );
+  if (statuses.some((s) => s !== "passed")) overallStatus = "failed";
 
   const finishedAt = new Date();
   await updateRunStatus(runId, overallStatus, finishedAt);
@@ -43,10 +47,64 @@ export async function executeRun(jobData: RunJobData) {
   });
 }
 
-async function runTest(
+/** Simple concurrency limiter */
+class ParallelPool {
+  private running = 0;
+  private queue: (() => void)[] = [];
+
+  constructor(private readonly concurrency: number) {}
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const execute = () => {
+        this.running++;
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            this.running--;
+            if (this.queue.length > 0) {
+              this.queue.shift()!();
+            }
+          });
+      };
+      if (this.running < this.concurrency) {
+        execute();
+      } else {
+        this.queue.push(execute);
+      }
+    });
+  }
+}
+
+/** Runs a single test, retrying up to test.maxRetries times on failure */
+async function runTestWithRetry(
   runId: string,
   testId: string,
   envVars: Record<string, string>
+): Promise<"passed" | "failed"> {
+  const test = await fetchTestWithSteps(testId);
+  const maxRetries = test.maxRetries ?? 0;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const status = await runTest(runId, testId, envVars, attempt);
+    if (status === "passed") return "passed";
+    if (attempt < maxRetries) {
+      console.log(`[runner-web] Test ${testId} failed, retrying (${attempt + 1}/${maxRetries})...`);
+      await broadcastWs(runId, {
+        type: "result:retrying",
+        runId,
+        payload: { testId, attempt: attempt + 1, maxRetries },
+      });
+    }
+  }
+  return "failed";
+}
+
+async function runTest(
+  runId: string,
+  testId: string,
+  envVars: Record<string, string>,
+  attempt = 0,
 ): Promise<"passed" | "failed"> {
   const test = await fetchTestWithSteps(testId);
 
@@ -61,7 +119,7 @@ async function runTest(
   await broadcastWs(runId, {
     type: "result:started",
     runId,
-    payload: { resultId, testId, testName: test.name },
+    payload: { resultId, testId, testName: test.name, attempt },
   });
 
   const browser = await launchBrowser();

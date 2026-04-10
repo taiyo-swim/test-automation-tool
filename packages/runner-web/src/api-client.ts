@@ -51,6 +51,7 @@ export interface TestDetails {
   platform: string;
   name: string;
   baseUrl?: string;
+  maxRetries: number;
   steps: TestStep[];
 }
 

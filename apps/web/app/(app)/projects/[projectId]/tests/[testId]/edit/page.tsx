@@ -19,7 +19,7 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Plus, Play, Save, ArrowLeft, GripVertical, Trash2, ChevronDown, Database } from "lucide-react";
+import { Plus, Play, Save, ArrowLeft, GripVertical, Trash2, ChevronDown, Database, Settings2, Tag, X } from "lucide-react";
 import { api } from "../../../../../../../lib/api";
 import type { Test, TestStep, StepAction } from "@e2e-tool/types";
 import { DatasetTab } from "../../../../../../../components/test/dataset-tab";
@@ -107,13 +107,23 @@ export default function TestEditPage() {
   const [steps, setSteps] = useState<LocalStep[]>([]);
   const [dirty, setDirty] = useState(false);
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"steps" | "data">("steps");
+  const [activeTab, setActiveTab] = useState<"steps" | "data" | "settings">("steps");
+  const [tagInput, setTagInput] = useState("");
+  const [localTags, setLocalTags] = useState<string[]>([]);
+  const [localMaxRetries, setLocalMaxRetries] = useState(0);
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [settingsInitialized, setSettingsInitialized] = useState(false);
 
   useEffect(() => {
     if (test?.steps) {
       setSteps(test.steps.map((s) => ({ ...s, params: s.params as Record<string, unknown> })));
     }
-  }, [test]);
+    if (test && !settingsInitialized) {
+      setLocalTags((test as unknown as { tags: string[] }).tags ?? []);
+      setLocalMaxRetries((test as unknown as { maxRetries: number }).maxRetries ?? 0);
+      setSettingsInitialized(true);
+    }
+  }, [test, settingsInitialized]);
 
   const saveSteps = useMutation({
     mutationFn: () =>
@@ -133,6 +143,32 @@ export default function TestEditPage() {
       router.push(`/projects/${projectId}/runs/${data.runId}`);
     },
   });
+
+  const saveSettings = useMutation({
+    mutationFn: () =>
+      api.patch(`/projects/${projectId}/tests/${testId}`, {
+        tags: localTags,
+        maxRetries: localMaxRetries,
+      }),
+    onSuccess: () => {
+      setSettingsDirty(false);
+      qc.invalidateQueries({ queryKey: ["tests", testId] });
+      qc.invalidateQueries({ queryKey: ["projects", projectId, "tests"] });
+    },
+  });
+
+  const addTag = () => {
+    const tag = tagInput.trim();
+    if (!tag || localTags.includes(tag)) return;
+    setLocalTags((prev) => [...prev, tag]);
+    setTagInput("");
+    setSettingsDirty(true);
+  };
+
+  const removeTag = (tag: string) => {
+    setLocalTags((prev) => prev.filter((t) => t !== tag));
+    setSettingsDirty(true);
+  };
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -235,11 +271,102 @@ export default function TestEditPage() {
           <Database size={11} />
           データセット
         </button>
+        <button
+          onClick={() => setActiveTab("settings")}
+          className={clsx(
+            "flex items-center gap-1 px-3 py-2 text-xs font-medium border-b-2 transition-colors",
+            activeTab === "settings" ? "border-primary-600 text-primary-700" : "border-transparent text-gray-500 hover:text-gray-700"
+          )}
+        >
+          <Settings2 size={11} />
+          テスト設定
+          {settingsDirty && <span className="w-1.5 h-1.5 rounded-full bg-amber-400 ml-0.5" />}
+        </button>
       </div>
 
       {activeTab === "data" ? (
         <div className="flex-1 overflow-auto">
           <DatasetTab projectId={projectId} testId={testId} />
+        </div>
+      ) : activeTab === "settings" ? (
+        <div className="flex-1 overflow-auto p-5 max-w-lg space-y-6">
+          {/* Tags */}
+          <section className="bg-white border border-gray-200 rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+              <Tag size={14} className="text-gray-400" /> タグ
+            </h3>
+            <div className="flex gap-2 mb-3">
+              <input
+                type="text"
+                value={tagInput}
+                onChange={(e) => setTagInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addTag()}
+                placeholder="タグを追加..."
+                className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary-500"
+              />
+              <button
+                onClick={addTag}
+                className="flex items-center gap-1 bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg text-sm"
+              >
+                <Plus size={13} /> 追加
+              </button>
+            </div>
+            {localTags.length === 0 ? (
+              <p className="text-xs text-gray-400">タグがありません</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {localTags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="flex items-center gap-1 bg-gray-100 text-gray-700 text-xs px-2 py-0.5 rounded-full"
+                  >
+                    {tag}
+                    <button onClick={() => removeTag(tag)} className="text-gray-400 hover:text-red-500">
+                      <X size={10} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Retry */}
+          <section className="bg-white border border-gray-200 rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-gray-900 mb-1">自動リトライ</h3>
+            <p className="text-xs text-gray-500 mb-4">
+              テストが失敗した場合、指定回数まで自動的に再試行します。
+            </p>
+            <div className="flex items-center gap-4">
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={1}
+                value={localMaxRetries}
+                onChange={(e) => { setLocalMaxRetries(Number(e.target.value)); setSettingsDirty(true); }}
+                className="flex-1"
+              />
+              <span className="text-sm font-semibold text-gray-800 w-20 text-center">
+                {localMaxRetries === 0 ? "リトライなし" : `最大 ${localMaxRetries} 回`}
+              </span>
+            </div>
+            <div className="flex justify-between text-xs text-gray-400 mt-0.5 px-0.5">
+              {[0, 1, 2, 3].map((v) => (
+                <span key={v}>{v}</span>
+              ))}
+            </div>
+          </section>
+
+          <button
+            onClick={() => saveSettings.mutate()}
+            disabled={!settingsDirty || saveSettings.isPending}
+            className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+          >
+            {saveSettings.isPending ? "保存中..." : "設定を保存"}
+          </button>
+          {saveSettings.isSuccess && !settingsDirty && (
+            <span className="text-xs text-green-600 ml-2">✓ 保存しました</span>
+          )}
         </div>
       ) : (
         /* Step List */

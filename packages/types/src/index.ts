@@ -350,4 +350,5 @@ export interface RunJobData {
   testIds: string[];
   environment?: string;
   envVariables?: Record<string, string>;
+  parallelism?: number;
 }

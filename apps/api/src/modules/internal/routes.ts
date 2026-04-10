@@ -159,6 +159,7 @@ export const internalRoutes: FastifyPluginAsync = async (app) => {
       platform: test.project.platform,
       name: test.name,
       baseUrl: test.project.baseUrl,
+      maxRetries: test.maxRetries,
       steps: test.steps,
     });
   });

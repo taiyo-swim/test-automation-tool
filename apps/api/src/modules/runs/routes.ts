@@ -17,13 +17,21 @@ export const runRoutes: FastifyPluginAsync = async (app) => {
     const body = z.object({
       testIds: z.array(z.string()).min(1),
       environment: z.string().optional(),
+      parallelism: z.number().int().min(1).max(10).default(1),
     }).safeParse(request.body);
 
     if (!body.success) {
       return reply.code(400).send({ error: "Bad Request", message: body.error.message, statusCode: 400 });
     }
 
-    const run = await createRun(projectId, body.data.testIds, "manual", body.data.environment, userId);
+    const run = await createRun(
+      projectId,
+      body.data.testIds,
+      "manual",
+      body.data.environment,
+      userId,
+      body.data.parallelism,
+    );
     return reply.code(202).send({ data: { runId: run.id, status: run.status } });
   });
 
@@ -94,14 +102,36 @@ export const runRoutes: FastifyPluginAsync = async (app) => {
     const query = z.object({
       page: z.coerce.number().int().min(1).default(1),
       pageSize: z.coerce.number().int().min(1).max(100).default(20),
+      tag: z.string().optional(),
+      status: z.string().optional(),
     }).safeParse(request.query);
 
     const page = query.success ? query.data.page : 1;
     const pageSize = query.success ? query.data.pageSize : 20;
+    const tagFilter = query.success ? query.data.tag : undefined;
+    const statusFilter = query.success ? query.data.status : undefined;
+
+    // If filtering by tag, find test IDs that have that tag first
+    let tagTestIds: string[] | undefined;
+    if (tagFilter) {
+      const tests = await prisma.test.findMany({
+        where: { projectId, tags: { has: tagFilter } },
+        select: { id: true },
+      });
+      tagTestIds = tests.map((t) => t.id);
+    }
+
+    const where = {
+      projectId,
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(tagTestIds !== undefined
+        ? { results: { some: { testId: { in: tagTestIds } } } }
+        : {}),
+    };
 
     const [runs, total] = await Promise.all([
       prisma.testRun.findMany({
-        where: { projectId },
+        where,
         orderBy: { createdAt: "desc" },
         skip: (page - 1) * pageSize,
         take: pageSize,
@@ -110,7 +140,7 @@ export const runRoutes: FastifyPluginAsync = async (app) => {
           triggeredBy: { select: { id: true, name: true } },
         },
       }),
-      prisma.testRun.count({ where: { projectId } }),
+      prisma.testRun.count({ where }),
     ]);
 
     return reply.send({ data: runs, total, page, pageSize });
@@ -294,6 +324,114 @@ export const runRoutes: FastifyPluginAsync = async (app) => {
     });
   });
 
+  // GET /api/projects/:projectId/analytics/trends — daily pass rate & avg duration (last N days)
+  app.get("/projects/:projectId/analytics/trends", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const q = z.object({ days: z.coerce.number().int().min(7).max(90).default(30) }).safeParse(request.query);
+    const days = q.success ? q.data.days : 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const runs = await prisma.testRun.findMany({
+      where: { projectId, createdAt: { gte: since }, status: { in: ["passed", "failed"] } },
+      select: { status: true, createdAt: true, results: { select: { durationMs: true, status: true } } },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Group by date (YYYY-MM-DD)
+    const byDate = new Map<string, { passed: number; failed: number; totalMs: number; msCount: number }>();
+    for (const run of runs) {
+      const date = run.createdAt.toISOString().slice(0, 10);
+      const entry = byDate.get(date) ?? { passed: 0, failed: 0, totalMs: 0, msCount: 0 };
+      if (run.status === "passed") entry.passed++;
+      else entry.failed++;
+      for (const r of run.results) {
+        if (r.durationMs != null) { entry.totalMs += r.durationMs; entry.msCount++; }
+      }
+      byDate.set(date, entry);
+    }
+
+    const data = Array.from(byDate.entries()).map(([date, v]) => ({
+      date,
+      passRate: v.passed + v.failed > 0 ? Math.round((v.passed / (v.passed + v.failed)) * 100) : null,
+      runs: v.passed + v.failed,
+      avgDurationMs: v.msCount > 0 ? Math.round(v.totalMs / v.msCount) : null,
+    }));
+
+    return reply.send({ data });
+  });
+
+  // GET /api/projects/:projectId/analytics/slowest — slowest tests (avg duration)
+  app.get("/projects/:projectId/analytics/slowest", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const results = await prisma.testRunResult.findMany({
+      where: { run: { projectId, createdAt: { gte: since } }, durationMs: { not: null } },
+      select: { testId: true, durationMs: true },
+    });
+
+    const byTest = new Map<string, { total: number; count: number }>();
+    for (const r of results) {
+      const e = byTest.get(r.testId) ?? { total: 0, count: 0 };
+      e.total += r.durationMs!;
+      e.count++;
+      byTest.set(r.testId, e);
+    }
+
+    const ranked = Array.from(byTest.entries())
+      .map(([testId, v]) => ({ testId, avgDurationMs: Math.round(v.total / v.count), runCount: v.count }))
+      .sort((a, b) => b.avgDurationMs - a.avgDurationMs)
+      .slice(0, 10);
+
+    const tests = await prisma.test.findMany({
+      where: { id: { in: ranked.map((r) => r.testId) } },
+      select: { id: true, name: true, tags: true },
+    });
+    const testMap = new Map(tests.map((t) => [t.id, t]));
+
+    return reply.send({
+      data: ranked.map((r) => ({ ...r, testName: testMap.get(r.testId)?.name ?? r.testId, tags: testMap.get(r.testId)?.tags ?? [] })),
+    });
+  });
+
+  // GET /api/projects/:projectId/notification-settings
+  app.get("/projects/:projectId/notification-settings", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const setting = await prisma.notificationSetting.findUnique({ where: { projectId } });
+    return reply.send({ data: setting });
+  });
+
+  // PATCH /api/projects/:projectId/notification-settings
+  app.patch("/projects/:projectId/notification-settings", { onRequest: [app.authenticate] }, async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const userId = (request.user as { sub: string }).sub;
+    if (!(await canAccessProject(projectId, userId))) return reply.code(403).send(forbidden());
+
+    const body = z.object({
+      slackWebhookUrl: z.string().url().nullish(),
+      notifyOnFailure: z.boolean().optional(),
+      notifyOnRecovery: z.boolean().optional(),
+      notifyOnSuccess: z.boolean().optional(),
+      emailRecipients: z.array(z.string().email()).optional(),
+    }).safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: "Bad Request", message: body.error.message, statusCode: 400 });
+
+    const setting = await prisma.notificationSetting.upsert({
+      where: { projectId },
+      create: { projectId, ...body.data },
+      update: body.data,
+    });
+    return reply.send({ data: setting });
+  });
+
   // GET /api/projects/:projectId/tests/:testId/datasets
   app.get("/projects/:projectId/tests/:testId/datasets", { onRequest: [app.authenticate] }, async (request, reply) => {
     const { projectId, testId } = request.params as { projectId: string; testId: string };
@@ -337,7 +475,8 @@ async function createRun(
   testIds: string[],
   trigger: "manual" | "schedule" | "api" | "ci",
   environment?: string,
-  triggeredById?: string
+  triggeredById?: string,
+  parallelism = 1,
 ) {
   const run = await prisma.testRun.create({
     data: {
@@ -346,6 +485,7 @@ async function createRun(
       status: "queued",
       environment: environment ?? null,
       triggeredById: triggeredById ?? null,
+      parallelism,
     },
   });
 
@@ -354,6 +494,7 @@ async function createRun(
     projectId,
     testIds,
     environment,
+    parallelism,
   });
 
   return run;
