@@ -151,6 +151,10 @@ export class EcsStack extends cdk.Stack {
         AWS_S3_BUCKET: screenshotsBucket.bucketName,
         AWS_REGION: this.region,
         REDIS_URL: `redis://${cacheEndpoint}:6379`,
+        // SMTP (email notifications) — set via SSM Parameter or override after deploy:
+        // SMTP_HOST: "email-smtp.ap-northeast-1.amazonaws.com",
+        // SMTP_PORT: "587",
+        // SMTP_FROM: '"E2E Tool" <noreply@your-domain.com>',
       },
       secrets: {
         DATABASE_URL: ecs.Secret.fromSecretsManager(dbUrlSecret),

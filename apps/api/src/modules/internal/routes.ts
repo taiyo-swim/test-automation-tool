@@ -3,6 +3,7 @@ import { prisma } from "../../db.js";
 import { broadcast } from "../../websocket/handler.js";
 import { saveFile } from "../../storage/index.js";
 import { notifySlack } from "../../notifications/slack.js";
+import { notifyEmail } from "../../notifications/email.js";
 import type { WsEvent } from "@e2e-tool/types";
 
 /**
@@ -49,26 +50,46 @@ export const internalRoutes: FastifyPluginAsync = async (app) => {
       },
     });
 
-    // Slack notification on run completion
+    // Notifications on run completion
     if (body.status === "passed" || body.status === "failed" || body.status === "cancelled") {
       const run = await prisma.testRun.findUnique({
         where: { id: runId },
         include: { results: { select: { status: true } } },
       });
-      if (run && process.env.SLACK_WEBHOOK_URL) {
+      if (run) {
+        // Detect recovery: find the last completed run before this one
+        const prevRun = await prisma.testRun.findFirst({
+          where: {
+            projectId: run.projectId,
+            id: { not: runId },
+            status: { in: ["passed", "failed"] },
+          },
+          orderBy: { finishedAt: "desc" },
+          select: { status: true },
+        });
+
         const startedAt = run.startedAt ? run.startedAt.getTime() : Date.now();
         const finishedAt = run.finishedAt ? run.finishedAt.getTime() : Date.now();
-        notifySlack({
+        const summary = {
           runId,
           projectId: run.projectId,
           status: body.status as "passed" | "failed" | "cancelled",
+          previousStatus: (prevRun?.status as "passed" | "failed" | null) ?? null,
           trigger: run.trigger,
           totalTests: run.results.length,
           passedTests: run.results.filter((r) => r.status === "passed").length,
           failedTests: run.results.filter((r) => r.status === "failed").length,
           durationMs: finishedAt - startedAt,
           appUrl: process.env.APP_URL ?? "http://localhost:3000",
-        }).catch(() => {}); // fire-and-forget
+        };
+
+        // Fire-and-forget both channels
+        notifySlack(summary).catch((e) =>
+          console.error("[notify] Slack failed:", e instanceof Error ? e.message : e)
+        );
+        notifyEmail(summary).catch((e) =>
+          console.error("[notify] Email failed:", e instanceof Error ? e.message : e)
+        );
       }
     }
 
