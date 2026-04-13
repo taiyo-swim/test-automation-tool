@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
+import { parseExpression } from "cron-parser";
 import { prisma } from "../../db.js";
 import { runQueue } from "../../queue/queues.js";
 
@@ -40,30 +41,16 @@ export const scheduleRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(400).send(badRequest("Invalid cron expression"));
     }
 
-    const env = body.data.environmentId
-      ? await prisma.environment.findUnique({ where: { id: body.data.environmentId } })
-      : null;
-
     const schedule = await prisma.schedule.create({
       data: {
         projectId,
         name: body.data.name,
         cronExpression: body.data.cronExpression,
+        testIds: body.data.testIds,
         environmentId: body.data.environmentId ?? null,
         enabled: body.data.enabled,
         nextRunAt: getNextRun(body.data.cronExpression),
       },
-    });
-
-    // Attach test IDs as JSON in the name field is wrong — store them properly
-    // We store testIds in the name until we add a dedicated field
-    // Actually let's add them to a separate JSON field via raw update
-    await prisma.$executeRaw`
-      UPDATE "Schedule"
-      SET "testIds" = ${JSON.stringify(body.data.testIds)}::jsonb
-      WHERE id = ${schedule.id}
-    `.catch(() => {
-      // Column may not exist yet — schedule still created
     });
 
     return reply.code(201).send({ data: schedule });
@@ -93,6 +80,8 @@ export const scheduleRoutes: FastifyPluginAsync = async (app) => {
           cronExpression: body.data.cronExpression,
           nextRunAt: getNextRun(body.data.cronExpression),
         }),
+        ...(body.data.testIds && { testIds: body.data.testIds }),
+        ...(body.data.environmentId !== undefined && { environmentId: body.data.environmentId ?? null }),
         ...(body.data.enabled !== undefined && { enabled: body.data.enabled }),
       },
     });
@@ -111,9 +100,12 @@ export const scheduleRoutes: FastifyPluginAsync = async (app) => {
 };
 
 function getNextRun(cronExpression: string): Date {
-  // Simple next-run calculation — add 1 minute as placeholder
-  // In production you'd use a library like `cron-parser`
-  return new Date(Date.now() + 60_000);
+  try {
+    const interval = parseExpression(cronExpression);
+    return interval.next().toDate();
+  } catch {
+    return new Date(Date.now() + 60_000);
+  }
 }
 
 async function canAccess(projectId: string, userId: string) {

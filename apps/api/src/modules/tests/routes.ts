@@ -7,6 +7,7 @@ const testSchema = z.object({
   description: z.string().optional(),
   tags: z.array(z.string()).default([]),
   folderId: z.string().optional(),
+  maxRetries: z.number().int().min(0).max(3).optional(),
 });
 
 const stepSchema = z.object({
@@ -51,6 +52,11 @@ export const testRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const test = await prisma.test.create({ data: { projectId, ...body.data } });
+
+    prisma.auditLog.create({
+      data: { projectId, userId, action: "test:created", meta: { testId: test.id, name: test.name } },
+    }).catch(() => {});
+
     return reply.code(201).send({ data: test });
   });
 
@@ -90,6 +96,11 @@ export const testRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const updated = await prisma.test.update({ where: { id: testId }, data: body.data });
+
+    prisma.auditLog.create({
+      data: { projectId, userId, action: "test:updated", meta: { testId, changes: Object.keys(body.data) } },
+    }).catch(() => {});
+
     return reply.send({ data: updated });
   });
 
@@ -129,6 +140,7 @@ export const testRoutes: FastifyPluginAsync = async (app) => {
         name: `${original.name} (Copy)`,
         description: original.description ?? undefined,
         tags: original.tags,
+        maxRetries: original.maxRetries,
         steps: {
           create: original.steps.map((s) => ({
             order: s.order,

@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Play, Copy, Trash2, FlaskConical, Tag, X } from "lucide-react";
+import { Plus, Play, Copy, Trash2, FlaskConical, Tag, X, Search } from "lucide-react";
 import { api } from "../../../../../lib/api";
 import type { Test } from "@e2e-tool/types";
 import clsx from "clsx";
@@ -15,6 +15,7 @@ export default function TestsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showNewTest, setShowNewTest] = useState(false);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
   const [runModal, setRunModal] = useState<{ testIds: string[] } | null>(null);
 
   const { data: tests, isLoading } = useQuery({
@@ -28,7 +29,17 @@ export default function TestsPage() {
     [tests]
   );
 
-  const filtered = tagFilter ? tests?.filter((t) => t.tags.includes(tagFilter)) : tests;
+  const filtered = useMemo(() => {
+    let result = tests ?? [];
+    if (tagFilter) result = result.filter((t) => t.tags.includes(tagFilter));
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      result = result.filter(
+        (t) => t.name.toLowerCase().includes(q) || (t.description ?? "").toLowerCase().includes(q)
+      );
+    }
+    return result;
+  }, [tests, tagFilter, searchQuery]);
 
   const createTest = useMutation({
     mutationFn: (values: { name: string; description?: string }) =>
@@ -99,6 +110,26 @@ export default function TestsPage() {
         </div>
       </div>
 
+      {/* Search bar */}
+      <div className="relative mb-3">
+        <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="テスト名・説明で検索..."
+          className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white"
+        />
+        {searchQuery && (
+          <button
+            onClick={() => setSearchQuery("")}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+          >
+            <X size={13} />
+          </button>
+        )}
+      </div>
+
       {/* Tag filter chips */}
       {allTags.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-4">
@@ -136,11 +167,17 @@ export default function TestsPage() {
         </div>
       )}
 
-      {!isLoading && (!filtered || filtered.length === 0) && (
+      {!isLoading && filtered.length === 0 && (
         <div className="text-center py-16 text-gray-400">
           <FlaskConical size={36} className="mx-auto mb-3 text-gray-200" />
-          <p className="text-sm">{tagFilter ? `"${tagFilter}" のテストがありません` : "テストがありません"}</p>
-          {!tagFilter && <p className="text-xs mt-1">「新規テスト」から作成してください</p>}
+          <p className="text-sm">
+            {searchQuery
+              ? `"${searchQuery}" に一致するテストがありません`
+              : tagFilter
+              ? `"${tagFilter}" のテストがありません`
+              : "テストがありません"}
+          </p>
+          {!tagFilter && !searchQuery && <p className="text-xs mt-1">「新規テスト」から作成してください</p>}
         </div>
       )}
 

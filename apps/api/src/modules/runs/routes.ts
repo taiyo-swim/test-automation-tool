@@ -497,6 +497,16 @@ async function createRun(
     parallelism,
   });
 
+  // Audit log — fire-and-forget
+  prisma.auditLog.create({
+    data: {
+      projectId,
+      userId: triggeredById ?? null,
+      action: "run:created",
+      meta: { runId: run.id, trigger, testCount: testIds.length, parallelism },
+    },
+  }).catch(() => {});
+
   return run;
 }
 

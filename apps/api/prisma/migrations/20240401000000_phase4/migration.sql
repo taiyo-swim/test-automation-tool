@@ -24,6 +24,9 @@ ALTER TABLE "NotificationSetting"
     ADD CONSTRAINT "NotificationSetting_projectId_fkey"
     FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
+-- Schedule: add testIds column (specific test IDs to execute)
+ALTER TABLE "Schedule" ADD COLUMN "testIds" JSONB NOT NULL DEFAULT '[]';
+
 -- AuditLog: action history per project
 CREATE TABLE "AuditLog" (
     "id" TEXT NOT NULL,

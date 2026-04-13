@@ -223,6 +223,7 @@ model Schedule {
   projectId      String
   name           String
   cronExpression String
+  testIds        Json      @default("[]") // string[] of Test IDs to run
   environmentId  String?
   enabled        Boolean   @default(true)
   lastRunAt      DateTime?
