@@ -1,0 +1,33 @@
+FROM mcr.microsoft.com/playwright:v1.49.1-noble AS base
+RUN corepack enable pnpm
+
+# ── Install dependencies ──────────────────────────────────────────
+FROM base AS deps
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml ./
+COPY packages/runner-web/package.json ./packages/runner-web/
+COPY packages/types/package.json ./packages/types/
+RUN pnpm install --frozen-lockfile
+
+# ── Build ─────────────────────────────────────────────────────────
+FROM base AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages/runner-web/node_modules ./packages/runner-web/node_modules
+COPY --from=deps /app/packages/types/node_modules ./packages/types/node_modules 2>/dev/null || true
+COPY . .
+
+RUN pnpm --filter types build
+RUN pnpm --filter runner-web build
+
+# ── Production image ──────────────────────────────────────────────
+FROM mcr.microsoft.com/playwright:v1.49.1-noble AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+RUN corepack enable pnpm
+
+COPY --from=builder /app/packages/runner-web/dist ./dist
+COPY --from=builder /app/packages/runner-web/node_modules ./node_modules
+COPY --from=builder /app/packages/runner-web/package.json ./package.json
+
+CMD ["node", "dist/index.js"]

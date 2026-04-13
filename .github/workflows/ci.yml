@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter types build
+      - run: pnpm --filter api db:generate
+      - run: pnpm --filter api build
+      - run: pnpm --filter web build
+
+  e2e-trigger:
+    name: Trigger E2E Tests
+    runs-on: ubuntu-latest
+    needs: typecheck
+    if: github.ref == 'refs/heads/main' && vars.E2E_API_TOKEN != ''
+    steps:
+      - name: Trigger E2E run
+        env:
+          E2E_API_TOKEN: ${{ secrets.E2E_API_TOKEN }}
+          E2E_PROJECT_URL: ${{ vars.E2E_PROJECT_URL }}
+          E2E_TEST_IDS: ${{ vars.E2E_TEST_IDS }}
+        run: |
+          RUN_ID=$(curl -s -X POST \
+            -H "Authorization: Bearer $E2E_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"testIds\": $(echo $E2E_TEST_IDS | tr ',' '\n' | jq -R . | jq -s .), \"environment\": \"staging\"}" \
+            "$E2E_PROJECT_URL/api/v1/runs" | jq -r '.data.runId')
+
+          echo "Run ID: $RUN_ID"
+
+          # Poll for result (max 10 minutes)
+          for i in $(seq 1 60); do
+            sleep 10
+            STATUS=$(curl -s \
+              -H "Authorization: Bearer $E2E_API_TOKEN" \
+              "$E2E_PROJECT_URL/api/v1/runs/$RUN_ID" | jq -r '.data.status')
+            echo "[$i/60] Status: $STATUS"
+            if [ "$STATUS" = "passed" ]; then
+              echo "✅ E2E tests passed"
+              exit 0
+            elif [ "$STATUS" = "failed" ]; then
+              echo "❌ E2E tests failed"
+              exit 1
+            elif [ "$STATUS" = "cancelled" ]; then
+              echo "⚠️  E2E tests cancelled"
+              exit 1
+            fi
+          done
+
+          echo "⏱️  E2E tests timed out"
+          exit 1
